@@ -1,0 +1,50 @@
+name: broken-pipeline-env
+version: "1.0.0"
+description: >
+  OpenEnv-compatible environment for training and evaluating LLM agents
+  on data pipeline debugging tasks.
+
+interface:
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
+  grader: POST /grader
+  tasks: GET /tasks
+  ping: GET /ping
+
+tasks:
+  - id: task1_easy
+    name: "Detect Null Values"
+    difficulty: easy
+    max_steps: 8
+    reward_correct: 0.2
+    reward_wrong: -0.1
+    reward_noop: -0.05
+
+  - id: task2_medium
+    name: "Fix Schema Problems"
+    difficulty: medium
+    max_steps: 8
+    reward_correct: 0.2
+    reward_wrong: -0.1
+    reward_noop: -0.05
+
+  - id: task3_hard
+    name: "Full Pipeline Debugging"
+    difficulty: hard
+    max_steps: 8
+    reward_correct: 0.2
+    reward_wrong: -0.1
+    reward_noop: -0.05
+
+actions:
+  - NOOP
+  - FIX_NULL
+  - FIX_TYPE
+  - FIX_DUPLICATE
+  - FIX_SCHEMA
+  - DEBUG_PIPELINE
+
+server:
+  host: "0.0.0.0"
+  port: 8000
