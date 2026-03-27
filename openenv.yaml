@@ -1,0 +1,36 @@
+name: broken-pipeline-env
+version: "1.0.0"
+description: >
+  OpenEnv-style environment for training and evaluating LLM agents
+  on data-pipeline debugging tasks.
+
+interface: openenv-v1
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+environment:
+  max_steps: 8
+  tasks:
+    - id: task1
+      name: "Detect Missing Values"
+      difficulty: easy
+    - id: task2
+      name: "Fix Schema / Format Problems"
+      difficulty: medium
+    - id: task3
+      name: "Full Pipeline Debug"
+      difficulty: hard
+
+rewards:
+  # These values mirror the constants in env/core.py
+  # (REWARD_CORRECT, REWARD_WRONG, REWARD_NOOP) and are listed here for
+  # documentation / configuration reference.
+  correct_action: 0.2
+  wrong_action: -0.1
+  noop_penalty: -0.05
+
+graders:
+  deterministic: true
+  score_range: [0.0, 1.0]
