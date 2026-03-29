@@ -1,130 +1,91 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 
-from env.data.bug_injector import inject_task1_bugs, inject_task2_bugs, inject_task3_bugs
-from env.data.generator import generate_employee_dataset
-from env.graders.grader1 import grade as grade_task1
-from env.graders.grader2 import grade as grade_task2
-from env.graders.grader3 import grade as grade_task3
-from env.models import DataAction, DataObservation, GraderResult
-from env.tasks.task1_audit import run_task as run_task1
-from env.tasks.task2_schema import run_task as run_task2
-from env.tasks.task3_incident import run_task as run_task3
+from env.graders.grader1 import grade_task1
+from env.graders.grader2 import grade_task2
+from env.graders.grader3 import grade_task3
+from env.models import DataAction, DataObservation, GraderResult, StepResult
+from env.tasks.task1_audit import Task1AuditEnv
+from env.tasks.task2_schema import Task2SchemaEnv
+from env.tasks.task3_incident import Task3IncidentEnv
 
 
-app = FastAPI(title="broken-pipeline-env", version="1.0.0")
-
-SCENARIO_DIR = Path(__file__).parent / "data" / "scenarios"
-TASK_IDS = ["task1", "task2", "task3"]
-
-STATE: dict[str, dict[str, Any]] = {}
+_envs: dict[int, object] = {}
 
 
-def _load_scenario(task_id: str) -> dict[str, Any]:
-    file_name = f"{task_id}_scenario.json"
-    scenario_file = SCENARIO_DIR / file_name
-    if not scenario_file.exists():
-        return {"task_id": task_id, "description": "No scenario file found"}
-    with scenario_file.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _envs[1] = Task1AuditEnv()
+    _envs[2] = Task2SchemaEnv()
+    _envs[3] = Task3IncidentEnv()
+    yield
+    _envs.clear()
 
 
-def _ensure_task(task_id: str) -> None:
-    if task_id not in TASK_IDS:
-        raise HTTPException(status_code=404, detail=f"Unknown task id: {task_id}")
+app = FastAPI(title="DataPipelineEnv", version="1.0.0", lifespan=lifespan)
 
 
-def _build_state(task_id: str) -> dict[str, Any]:
-    seed = {"task1": 42, "task2": 84, "task3": 126}[task_id]
-    clean = generate_employee_dataset(seed=seed)
-
-    if task_id == "task1":
-        broken, truth = inject_task1_bugs(clean)
-    elif task_id == "task2":
-        broken, truth = inject_task2_bugs(clean)
-    else:
-        broken, truth = inject_task3_bugs(clean)
-
-    return {
-        "dataset": broken,
-        "ground_truth": truth,
-        "scenario": _load_scenario(task_id),
-        "observation": None,
-    }
+def _get_env(task_id: int):
+    if task_id not in _envs:
+        raise HTTPException(status_code=404, detail=f"task_id {task_id} not found")
+    return _envs[task_id]
 
 
-def _run_observation(task_id: str, dataset: list[dict]) -> DataObservation:
-    if task_id == "task1":
-        return run_task1(dataset)
-    if task_id == "task2":
-        return run_task2(dataset)
-    return run_task3(dataset)
-
-
-def _grade(task_id: str, action: DataAction, obs: DataObservation, truth: dict) -> GraderResult:
-    if task_id == "task1":
-        return grade_task1(action, obs, truth)
-    if task_id == "task2":
-        return grade_task2(action, obs, truth)
-    return grade_task3(action, obs, truth)
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+@app.get("/ping")
+def ping() -> dict[str, str]:
+    try:
+        return {"status": "ok"}
+    except Exception:
+        return {"status": "ok"}
 
 
 @app.get("/tasks")
-def list_tasks() -> dict[str, list[str]]:
-    return {"tasks": TASK_IDS}
-
-
-@app.post("/reset/{task_id}")
-def reset_task(task_id: str) -> dict[str, Any]:
-    _ensure_task(task_id)
-    STATE[task_id] = _build_state(task_id)
+def list_tasks() -> dict[str, list[dict[str, Any]]]:
     return {
-        "task_id": task_id,
-        "message": "task state reset",
-        "scenario": STATE[task_id]["scenario"],
+        "tasks": [
+            {"id": 1, "name": "Data Quality Audit", "difficulty": "easy", "max_steps": 8},
+            {"id": 2, "name": "Schema Drift Remediation", "difficulty": "medium", "max_steps": 8},
+            {"id": 3, "name": "Full Data Incident Response", "difficulty": "hard", "max_steps": 8},
+        ]
     }
 
 
-@app.get("/scenario/{task_id}")
-def get_scenario(task_id: str) -> dict[str, Any]:
-    _ensure_task(task_id)
-    if task_id not in STATE:
-        STATE[task_id] = _build_state(task_id)
-    return {"task_id": task_id, "scenario": STATE[task_id]["scenario"]}
-
-
-@app.get("/observe/{task_id}", response_model=DataObservation)
-def observe(task_id: str) -> DataObservation:
-    _ensure_task(task_id)
-    if task_id not in STATE:
-        STATE[task_id] = _build_state(task_id)
-    obs = _run_observation(task_id, STATE[task_id]["dataset"])
-    STATE[task_id]["observation"] = obs
+@app.post("/reset", response_model=DataObservation)
+def reset(task_id: int = 1) -> DataObservation:
+    env = _get_env(task_id)
+    obs = env.reset()
     return obs
 
 
-@app.post("/act/{task_id}", response_model=GraderResult)
-def act(task_id: str, action: DataAction) -> GraderResult:
-    _ensure_task(task_id)
-    if action.task_id != task_id:
-        raise HTTPException(status_code=400, detail="task_id in payload must match path")
+@app.post("/step", response_model=StepResult)
+def step(action: DataAction, task_id: int = 1) -> StepResult:
+    env = _get_env(task_id)
+    return env.step(action)
 
-    if task_id not in STATE:
-        STATE[task_id] = _build_state(task_id)
 
-    obs = STATE[task_id]["observation"]
-    if obs is None:
-        obs = _run_observation(task_id, STATE[task_id]["dataset"])
-        STATE[task_id]["observation"] = obs
+@app.get("/state", response_model=DataObservation)
+def state(task_id: int = 1) -> DataObservation:
+    return _get_env(task_id).state()
 
-    return _grade(task_id, action, obs, STATE[task_id]["ground_truth"])
+
+@app.get("/grader", response_model=GraderResult)
+def grader(task_id: int = 1) -> GraderResult:
+    if task_id == 1:
+        return grade_task1(_envs[1])
+    if task_id == 2:
+        return grade_task2(_envs[2])
+    if task_id == 3:
+        return grade_task3(_envs[3])
+    raise HTTPException(status_code=404, detail=f"task_id {task_id} not found")
+
+
+@app.get("/baseline")
+def baseline() -> dict[str, Any]:
+    return {
+        "description": "NOOP agent — scores ~0.0 on all tasks.",
+        "scores": {"task_1": 0.0, "task_2": 0.0, "task_3": 0.0},
+    }

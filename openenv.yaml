@@ -1,23 +1,31 @@
-name: broken-pipeline-env
-version: 1.0.0
-entrypoint: inference.py
-description: Synthetic data operations environment with three incident-response tasks.
+name: "DataPipelineEnv"
+version: "1.0.0"
+description: >
+  Standardized environment simulating a broken enterprise data pipeline.
+  An LLM agent acts as an on-call data engineer — inspecting, fixing,
+  and validating datasets before a production ETL job runs.
+
 tasks:
-	- id: task1
-		title: Data quality audit
-		difficulty: easy
-	- id: task2
-		title: Schema drift remediation
-		difficulty: medium
-	- id: task3
-		title: Full incident response
-		difficulty: hard
-api:
-	base_path: /
-	endpoints:
-		- GET /health
-		- GET /tasks
-		- POST /reset/{task_id}
-		- GET /scenario/{task_id}
-		- GET /observe/{task_id}
-		- POST /act/{task_id}
+  - id: 1
+    name: "Data Quality Audit"
+    difficulty: "easy"
+    max_steps: 8
+  - id: 2
+    name: "Schema Drift Remediation"
+    difficulty: "medium"
+    max_steps: 8
+  - id: 3
+    name: "Full Data Incident Response"
+    difficulty: "hard"
+    max_steps: 8
+
+action_space:
+  type: "structured_json"
+  model: "DataAction"
+
+observation_space:
+  type: "structured_json"
+  model: "DataObservation"
+
+reward_range: [-0.5, 1.0]
+grader_output_range: [0.0, 1.0]

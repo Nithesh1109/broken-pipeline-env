@@ -1,26 +1,22 @@
-from __future__ import annotations
+from env.models import GraderResult
+from env.tasks.task1_audit import Task1AuditEnv
 
-from env.models import DataAction, DataObservation, GraderResult
 
-
-def grade(action: DataAction, observation: DataObservation, ground_truth: dict) -> GraderResult:
-    expected = max(1, int(ground_truth.get("total_issues", 1)))
-    found = int(observation.metrics.get("total_issues", 0))
-    detection_score = min(found / expected, 1.0)
-
-    action_bonus = 0.0
-    if action.findings:
-        action_bonus += 0.1
-    if action.remediations:
-        action_bonus += 0.1
-
-    score = min(1.0, detection_score + action_bonus)
-    passed = score >= 0.7
-
-    feedback = [
-        f"Detected {found}/{expected} expected issues.",
-        "Included findings." if action.findings else "No findings submitted.",
-        "Included remediations." if action.remediations else "No remediations submitted.",
-    ]
-
-    return GraderResult(task_id="task1", score=score, passed=passed, feedback=feedback)
+def grade_task1(env: Task1AuditEnv) -> GraderResult:
+    total = env.TOTAL_BUGS
+    id_score = len(env.identified_bug_ids) / total
+    fix_score = len(env.fixed_bug_ids) / total
+    score = round(0.4 * id_score + 0.6 * fix_score, 4)
+    score = round(max(0.0, min(1.0, score)), 4)
+    return GraderResult(
+        score=score,
+        breakdown={
+            "identification": round(id_score, 4),
+            "remediation": round(fix_score, 4),
+        },
+        explanation=(
+            f"Identified {len(env.identified_bug_ids)}/{total} bugs, "
+            f"fixed {len(env.fixed_bug_ids)}/{total} bugs. "
+            f"Score = 0.4*{id_score:.2f} + 0.6*{fix_score:.2f} = {score}"
+        ),
+    )

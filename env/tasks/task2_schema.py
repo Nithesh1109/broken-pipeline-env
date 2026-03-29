@@ -1,50 +1,181 @@
 from __future__ import annotations
 
-from env.models import DataObservation
+import json
+from pathlib import Path
+
+import pandas as pd
+
+from env.data.bug_injector import inject_bugs, load_scenario
+from env.data.generator import generate_employee_dataset
+from env.models import ActionType, DataAction, DataObservation, DetectedIssue, StepResult
 
 
-EXPECTED_COLUMNS = {"employee_id", "name", "department", "salary", "start_date"}
+class Task2SchemaEnv:
+    """Task 2 environment for schema drift diagnosis and remediation."""
 
+    MAX_STEPS = 8
+    TOTAL_BUGS = 3
+    SCENARIO_PATH = Path(__file__).parent.parent / "data" / "scenarios" / "task2_scenario.json"
 
-def run_task(records: list[dict]) -> DataObservation:
-    salary_as_string = sum(1 for row in records if isinstance(row.get("salary"), str))
-    team_used = sum(1 for row in records if "team" in row and "department" not in row)
+    def __init__(self) -> None:
+        """Initialize dependency graph and task state containers."""
+        with self.SCENARIO_PATH.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.COLUMN_DEPENDENCIES: dict[str, list[str]] = payload.get("column_dependencies", {})
 
-    columns_seen: set[str] = set()
-    for row in records:
-        columns_seen.update(row.keys())
+        self.df: pd.DataFrame = pd.DataFrame()
+        self.ground_truth: list[dict] = []
+        self.step_count: int = 0
+        self.fixed_bug_ids: set[str] = set()
+        self.downstream_health: float = 0.0
+        self.blast_events: int = 0
 
-    unexpected_columns = sorted(col for col in columns_seen if col not in EXPECTED_COLUMNS)
+    def reset(self) -> DataObservation:
+        """Reset state and initialize a fresh corrupted Task2 dataframe."""
+        scenario_bugs = load_scenario(str(self.SCENARIO_PATH))
+        clean_df = generate_employee_dataset(seed=42)
+        self.df, self.ground_truth = inject_bugs(clean_df, scenario_bugs)
+        self.step_count = 0
+        self.fixed_bug_ids = set()
+        self.downstream_health = 0.0
+        self.blast_events: int = 0
+        return self._build_observation()
 
-    remediated: list[dict] = []
-    for row in records:
-        fixed = dict(row)
-        if "team" in fixed and "department" not in fixed:
-            fixed["department"] = fixed.pop("team")
-        if isinstance(fixed.get("salary"), str):
-            try:
-                fixed["salary"] = int(fixed["salary"])
-            except ValueError:
-                fixed["salary"] = None
-        for extra_key in list(fixed.keys()):
-            if extra_key not in EXPECTED_COLUMNS:
-                fixed.pop(extra_key)
-        remediated.append(fixed)
+    def _rows_passing(self) -> int:
+        """Count rows passing essential schema conditions in current dataframe."""
+        if self.df.empty:
+            return 0
 
-    drift_count = salary_as_string + team_used + max(0, len(unexpected_columns) - 1) * len(records)
+        expected_columns = {
+            "employee_id",
+            "name",
+            "age",
+            "salary",
+            "department",
+            "phone",
+            "ssn",
+            "hire_date",
+            "consent_flag",
+        }
+        if not expected_columns.issubset(set(self.df.columns)):
+            return 0
 
-    return DataObservation(
-        task_id="task2",
-        status="warning" if drift_count > 0 else "ok",
-        message="Schema drift analysis complete",
-        metrics={
-            "record_count": len(records),
-            "salary_as_string": salary_as_string,
-            "team_used_instead_of_department": team_used,
-            "drift_count": drift_count,
-        },
-        payload={
-            "unexpected_columns": unexpected_columns,
-            "remediated_preview": remediated[:3],
-        },
-    )
+        salary_ok = pd.to_numeric(self.df["salary"], errors="coerce").notna()
+        age_ok = pd.to_numeric(self.df["age"], errors="coerce").between(0, 120, inclusive="both")
+        hire_ok = pd.to_datetime(self.df["hire_date"], errors="coerce").notna()
+        consent_ok = self.df["consent_flag"].notna()
+        return int((salary_ok & age_ok & hire_ok & consent_ok).sum())
+
+    def step(self, action: DataAction) -> StepResult:
+        """Apply one schema remediation step and return transition output."""
+        reward = 0.0
+        done = False
+
+        scenario_bugs = load_scenario(str(self.SCENARIO_PATH))
+        expected_renames = {
+            b["new_col"]: b["old_col"]
+            for b in scenario_bugs
+            if b.get("type") == "schema_drift"
+        }
+
+        if action.action_type == ActionType.DROP_COLUMN:
+            dependents = self.COLUMN_DEPENDENCIES.get(action.target_column, [])
+            if dependents:
+                penalty = -0.10 * len(dependents)
+                self.downstream_health = max(0.0, self.downstream_health - 0.15 * len(dependents))
+                self.blast_events += 1
+                reward += penalty
+            else:
+                reward -= 0.10
+
+        elif action.action_type == ActionType.RENAME_COLUMN:
+            if action.target_column in expected_renames and action.transformation == expected_renames[action.target_column]:
+                src = action.target_column
+                dst = action.transformation
+                if src in self.df.columns and dst not in self.df.columns:
+                    self.df.rename(columns={src: dst}, inplace=True)
+                for bug in self.ground_truth:
+                    if bug["type"] == "schema_drift" and bug.get("column") == dst:
+                        self.fixed_bug_ids.add(bug["bug_id"])
+                reward += 0.20
+            else:
+                reward -= 0.10
+
+        elif action.action_type == ActionType.CAST_TYPE:
+            if action.target_column in {"hire_date", "dob_date"} and action.transformation == "cast_to_date":
+                col = "hire_date" if "hire_date" in self.df.columns else "dob_date"
+                if col in self.df.columns:
+                    self.df[col] = pd.to_datetime(self.df[col], errors="coerce").dt.strftime("%Y-%m-%d")
+                    self.fixed_bug_ids.add("B002")
+                    reward += 0.20
+                else:
+                    reward -= 0.10
+            else:
+                reward -= 0.10
+
+        elif action.action_type == ActionType.FILL_DEFAULT:
+            if action.target_column == "consent_flag" and "consent_flag" in self.df.columns:
+                self.df["consent_flag"] = self.df["consent_flag"].fillna(False)
+                self.fixed_bug_ids.add("B003")
+                reward += 0.20
+            else:
+                reward -= 0.10
+
+        elif action.action_type == ActionType.VALIDATE:
+            rows_passing = self._rows_passing()
+            reward += 0.25 * (rows_passing / max(len(self.df), 1))
+            if len(self.fixed_bug_ids) == self.TOTAL_BUGS:
+                done = True
+                reward += 0.05
+
+        elif action.action_type == ActionType.NOOP:
+            reward = 0.0
+
+        else:
+            reward -= 0.10
+
+        reward = max(-0.5, min(1.0, reward))
+        self.step_count += 1
+        self.downstream_health = len(self.fixed_bug_ids) / self.TOTAL_BUGS
+        done = done or (self.step_count >= self.MAX_STEPS)
+
+        return StepResult(
+            observation=self._build_observation(),
+            reward=round(reward, 4),
+            done=done,
+            info={"blast_events": self.blast_events, "fixed": list(self.fixed_bug_ids)},
+        )
+
+    def _build_observation(self) -> DataObservation:
+        """Construct DataObservation from current dataframe and unresolved bugs."""
+        unresolved = [t for t in self.ground_truth if t["bug_id"] not in self.fixed_bug_ids]
+        validation_report = [
+            DetectedIssue(
+                issue_type=b["type"],
+                column=b.get("column"),
+                description=b["description"],
+                severity=b["severity"],
+            )
+            for b in unresolved
+        ]
+
+        schema_dict = {
+            col: {"type": str(dtype), "nullable": bool(self.df[col].isna().any())}
+            for col, dtype in self.df.dtypes.items()
+        }
+
+        return DataObservation(
+            dataset_preview=self.df.head(10).to_dict(orient="records"),
+            column_schema=schema_dict,
+            pipeline_stage="SCHEMA_REMEDIATION",
+            validation_report=validation_report,
+            time_remaining=self.MAX_STEPS - self.step_count,
+            downstream_health=self.downstream_health,
+            step_count=self.step_count,
+            task_id=2,
+            pipeline_stage_health=None,
+        )
+
+    def state(self) -> DataObservation:
+        """Return current state without changing environment variables."""
+        return self._build_observation()

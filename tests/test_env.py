@@ -1,86 +1,116 @@
-from fastapi.testclient import TestClient
-
-from env.server import app
-
-
-client = TestClient(app)
+from env.data.generator import generate_employee_dataset
+from env.graders import grade_task1, grade_task3
+from env.models import ActionType, DataAction, DataObservation
+from env.tasks import Task1AuditEnv, Task2SchemaEnv, Task3IncidentEnv
 
 
-def _sample_action(task_id: str) -> dict:
-	if task_id == "task1":
-		return {
-			"task_id": "task1",
-			"findings": ["duplicate IDs", "missing salary", "negative salary"],
-			"remediations": ["deduplicate records", "fill missing salary from source"],
-			"notes": "audit complete",
-			"metadata": {},
-		}
-	if task_id == "task2":
-		return {
-			"task_id": "task2",
-			"findings": ["team column replacing department", "salary typed as string"],
-			"remediations": [
-				"rename team to department",
-				"cast salary to int",
-				"drop region",
-			],
-			"notes": "schema drift repaired",
-			"metadata": {},
-		}
-	return {
-		"task_id": "task3",
-		"findings": ["incident severity high"],
-		"remediations": [
-			"isolate bad records",
-			"rollback schema change",
-			"backfill critical fields",
-			"add monitoring alerts",
-		],
-		"notes": "incident handled",
-		"metadata": {},
-	}
+def test_reset_returns_valid_observation():
+	env = Task1AuditEnv()
+	obs = env.reset()
+	assert isinstance(obs, DataObservation)
+	assert len(obs.dataset_preview) > 0
+	assert 0.0 <= obs.downstream_health <= 1.0
+	assert obs.time_remaining == 8
+	assert obs.task_id == 1
 
 
-def test_health_endpoint():
-	response = client.get("/health")
-	assert response.status_code == 200
-	assert response.json()["status"] == "ok"
+def test_step_loop_terminates_at_max_steps():
+	env = Task1AuditEnv()
+	env.reset()
+	done = False
+	for _ in range(10):
+		result = env.step(DataAction(action_type=ActionType.NOOP, justification="test"))
+		if result.done:
+			done = True
+			break
+	assert done
 
 
-def test_task_listing():
-	response = client.get("/tasks")
-	assert response.status_code == 200
-	assert response.json()["tasks"] == ["task1", "task2", "task3"]
+def test_grader_is_deterministic():
+	env = Task1AuditEnv()
+	env.reset()
+	s1 = grade_task1(env).score
+	s2 = grade_task1(env).score
+	assert s1 == s2
 
 
-def test_task1_observe_and_grade():
-	assert client.post("/reset/task1").status_code == 200
-	obs = client.get("/observe/task1")
-	assert obs.status_code == 200
-	assert obs.json()["task_id"] == "task1"
-	result = client.post("/act/task1", json=_sample_action("task1"))
-	assert result.status_code == 200
-	payload = result.json()
-	assert 0.0 <= payload["score"] <= 1.0
+def test_noop_baseline_scores_below_threshold():
+	env = Task1AuditEnv()
+	env.reset()
+	for _ in range(8):
+		env.step(DataAction(action_type=ActionType.NOOP, justification="noop"))
+	assert grade_task1(env).score < 0.1
 
 
-def test_task2_observe_and_grade():
-	assert client.post("/reset/task2").status_code == 200
-	obs = client.get("/observe/task2")
-	assert obs.status_code == 200
-	assert obs.json()["task_id"] == "task2"
-	result = client.post("/act/task2", json=_sample_action("task2"))
-	assert result.status_code == 200
-	payload = result.json()
-	assert 0.0 <= payload["score"] <= 1.0
+def test_correct_fix_increases_score():
+	env = Task1AuditEnv()
+	env.reset()
+	score_before = grade_task1(env).score
+	env.step(
+		DataAction(
+			action_type=ActionType.FILL_DEFAULT,
+			target_column="salary",
+			transformation="fill_median",
+			justification="Filling null salary values.",
+		)
+	)
+	score_after = grade_task1(env).score
+	assert score_after > score_before
 
 
-def test_task3_observe_and_grade():
-	assert client.post("/reset/task3").status_code == 200
-	obs = client.get("/observe/task3")
-	assert obs.status_code == 200
-	assert obs.json()["task_id"] == "task3"
-	result = client.post("/act/task3", json=_sample_action("task3"))
-	assert result.status_code == 200
-	payload = result.json()
-	assert 0.0 <= payload["score"] <= 1.0
+def test_generator_is_deterministic():
+	df1 = generate_employee_dataset(seed=42)
+	df2 = generate_employee_dataset(seed=42)
+	assert df1.equals(df2)
+
+
+def test_server_ping():
+	from fastapi.testclient import TestClient
+
+	from env.server import app
+
+	with TestClient(app) as client:
+		response = client.get("/ping")
+		assert response.status_code == 200
+		assert response.json() == {"status": "ok"}
+
+
+def test_server_reset_and_step():
+	from fastapi.testclient import TestClient
+
+	from env.server import app
+
+	with TestClient(app) as client:
+		obs = client.post("/reset", params={"task_id": 1}).json()
+		assert "dataset_preview" in obs
+		assert "schema" in obs
+		result = client.post(
+			"/step",
+			json={"action_type": "NOOP", "justification": "test"},
+			params={"task_id": 1},
+		).json()
+		assert "reward" in result
+		assert "done" in result
+
+
+def test_task3_pii_penalty():
+	env = Task3IncidentEnv()
+	env.reset()
+	for _ in range(8):
+		env.step(DataAction(action_type=ActionType.NOOP, justification="noop"))
+	result = grade_task3(env)
+	assert result.breakdown["pii_compliance_penalty"] == -0.2
+
+
+def test_blast_radius_penalizes_score():
+	env = Task2SchemaEnv()
+	env.reset()
+	health_before = env.downstream_health
+	env.step(
+		DataAction(
+			action_type=ActionType.DROP_COLUMN,
+			target_column="salary",
+			justification="Dropping salary column.",
+		)
+	)
+	assert env.downstream_health < health_before or env.blast_events > 0
