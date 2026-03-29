@@ -1,0 +1,10 @@
+{
+  "task_id": "task2",
+  "title": "Schema drift remediation",
+  "objective": "Detect and remediate upstream schema drift without dropping critical business columns.",
+  "hints": [
+    "Watch for renamed columns.",
+    "Normalize salary typing.",
+    "Drop unexpected fields after review."
+  ]
+}

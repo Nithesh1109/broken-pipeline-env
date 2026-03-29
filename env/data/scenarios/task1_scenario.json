@@ -1,0 +1,9 @@
+{
+  "task_id": "task1",
+  "title": "Data quality audit",
+  "objective": "Find duplicate IDs and salary data quality issues before nightly reporting.",
+  "hints": [
+    "Check duplicate primary keys.",
+    "Check null and invalid salary values."
+  ]
+}

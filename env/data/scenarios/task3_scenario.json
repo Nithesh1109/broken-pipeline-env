@@ -1,0 +1,10 @@
+{
+  "task_id": "task3",
+  "title": "Full incident response",
+  "objective": "Triage a high-severity data incident and propose immediate and preventive actions.",
+  "hints": [
+    "Classify severity from symptom count.",
+    "Contain bad records first.",
+    "Include long-term prevention actions."
+  ]
+}
