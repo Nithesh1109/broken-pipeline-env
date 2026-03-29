@@ -1,0 +1,44 @@
+{
+  "task_id": "task3_incident",
+  "incident_report": {
+    "summary": "Pipeline failure detected. Root cause: [deadlock] (hidden).",
+    "symptoms": [
+      "Job execution stalled for > 10 minutes.",
+      "Alert fired: pipeline SLA breach."
+    ],
+    "timeline": [
+      {
+        "time": "T-30m",
+        "event": "Normal operations."
+      },
+      {
+        "time": "T-10m",
+        "event": "Latency spike observed."
+      },
+      {
+        "time": "T-0m",
+        "event": "Pipeline halted."
+      }
+    ],
+    "metrics": {
+      "cpu_usage": "35%",
+      "memory_usage": "87%",
+      "disk_usage": "52%"
+    }
+  },
+  "root_cause": "deadlock",
+  "accepted_causes": [
+    "deadlock"
+  ],
+  "mitigation_keywords": [
+    "deadlock",
+    "lock",
+    "transaction",
+    "rollback"
+  ],
+  "suggested_mitigation": [
+    "Identify and kill blocked transactions.",
+    "Review locking order in database queries.",
+    "Implement deadlock detection and automatic rollback."
+  ]
+}

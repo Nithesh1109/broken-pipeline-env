@@ -1,0 +1,133 @@
+{
+  "task_id": "task2_schema",
+  "schema": {
+    "fields": {
+      "id": {
+        "type": "int",
+        "required": true
+      },
+      "name": {
+        "type": "str",
+        "required": true
+      },
+      "age": {
+        "type": "int",
+        "required": true,
+        "min": 0,
+        "max": 120
+      },
+      "score": {
+        "type": "float",
+        "required": false
+      }
+    }
+  },
+  "records": [
+    {
+      "id": 0,
+      "name": "user_0",
+      "age": 58,
+      "score": 83.41
+    },
+    {
+      "id": 1,
+      "name": "user_1",
+      "age": 28,
+      "score": 37.02
+    },
+    {
+      "id": 2,
+      "name": "user_2",
+      "age": 31,
+      "score": 67.02
+    },
+    {
+      "id": 3,
+      "name": "user_3",
+      "age": 200,
+      "score": 93.67
+    },
+    {
+      "id": 4,
+      "name": "user_4",
+      "age": 59,
+      "score": 7.14
+    },
+    {
+      "id": 5,
+      "name": "user_5",
+      "age": 200,
+      "score": 17.11
+    },
+    {
+      "id": 6,
+      "name": "user_6",
+      "age": 64,
+      "score": 24.48
+    },
+    {
+      "id": 7,
+      "name": "user_7",
+      "age": 47,
+      "score": 37.95
+    },
+    {
+      "id": 8,
+      "name": "user_8",
+      "age": 58,
+      "score": 68.82
+    },
+    {
+      "id": 9,
+      "name": "user_9",
+      "age": 32,
+      "score": 68.46
+    },
+    {
+      "id": 10,
+      "age": 21,
+      "score": 22.9
+    },
+    {
+      "id": 11,
+      "name": "user_11",
+      "age": 20,
+      "score": 80.5
+    },
+    {
+      "id": 12,
+      "name": "user_12",
+      "age": 43,
+      "score": 26.77
+    },
+    {
+      "id": 13,
+      "name": "user_13",
+      "age": 31,
+      "score": 91.31
+    },
+    {
+      "id": 14,
+      "name": "user_14",
+      "age": 54,
+      "score": 87.64
+    }
+  ],
+  "violations": [
+    {
+      "record_index": 5,
+      "field": "age",
+      "violation_type": "out_of_range"
+    },
+    {
+      "record_index": 3,
+      "field": "age",
+      "violation_type": "out_of_range"
+    },
+    {
+      "record_index": 10,
+      "field": "name",
+      "violation_type": "missing_required"
+    }
+  ]
+}
