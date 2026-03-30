@@ -59,3 +59,82 @@ class GraderResult(BaseModel):
     score: float
     breakdown: dict[str, float]
     explanation: str
+
+
+# -- Observability facets -- unlocked progressively via INSPECT actions --
+
+class AlertSignal(BaseModel):
+    severity: Literal["low", "medium", "high", "critical"]
+    message: str
+    risk_score: float = Field(ge=0.0, le=1.0)
+
+
+class DagOverview(BaseModel):
+    current_node: str
+    upstream_nodes: List[str]
+    downstream_nodes: List[str]
+
+
+class MetricsFacet(BaseModel):
+    row_count: int
+    historical_avg: int
+    null_ratio: float = Field(ge=0.0, le=1.0)
+    storage_bytes: Optional[int] = None
+
+
+class LogsFacet(BaseModel):
+    recent_errors: List[str]
+    last_run_status: Literal["success", "failed", "warning", "running"]
+
+
+class ComplianceFacet(BaseModel):
+    pii_detected: bool
+    risky_columns: List[str]
+
+
+class VisibleSignals(BaseModel):
+    """
+    Returned inside StepResult.info as progressively unlocked facets.
+    At reset: only alert is populated; other facets are unlocked by actions.
+    """
+
+    alert: AlertSignal
+    dag: Optional[DagOverview] = None
+    metrics: Optional[MetricsFacet] = None
+    logs: Optional[LogsFacet] = None
+    compliance: Optional[ComplianceFacet] = None
+
+
+# -- Agent execution record -- reasoning trace --
+
+class AERRecord(BaseModel):
+    """
+    Tracks agent reasoning per step and can be used for grader partial credit.
+    """
+
+    step_id: int
+    action_type: str
+    target: Optional[str]
+    justification: str
+    reward_earned: float
+    issues_identified: List[str]
+    issues_fixed: List[str]
+
+
+# -- Failure mode signatures -- used by bug injector and tasks --
+
+class FailureSignature(BaseModel):
+    """Describes the type of industry failure being simulated."""
+
+    failure_type: Literal[
+        "zombie_partition",
+        "silent_drop",
+        "schema_drift",
+        "pii_leak",
+        "swallowed_exception",
+        "duplicate_aggregation",
+        "type_corruption",
+    ]
+    affected_stage: str
+    blast_radius: Literal["low", "medium", "high", "critical"]
+    detection_hint: str

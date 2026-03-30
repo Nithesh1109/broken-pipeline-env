@@ -133,6 +133,84 @@ def inject_bugs(df: pd.DataFrame, bug_spec: list[dict]) -> tuple[pd.DataFrame, l
     return corrupted, ground_truth
 
 
+def get_failure_signature(bug_spec: list[dict]):
+    """
+    Derives a FailureSignature from the bug spec.
+    Used by task classes to build the initial AlertSignal.
+    Maps bug types to industry failure mode names.
+    """
+    from env.models import FailureSignature
+
+    type_map = {
+        "null_injection": "silent_drop",
+        "type_corruption": "type_corruption",
+        "out_of_range": "type_corruption",
+        "format_inconsistency": "schema_drift",
+        "schema_drift": "schema_drift",
+        "pii_leak": "pii_leak",
+        "duplicate_rows": "duplicate_aggregation",
+    }
+
+    severity_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    sorted_bugs = sorted(
+        bug_spec,
+        key=lambda b: severity_order.get(b.get("severity", "low"), 0),
+        reverse=True,
+    )
+    top_bug = sorted_bugs[0] if sorted_bugs else {}
+    failure_type = type_map.get(top_bug.get("type", "schema_drift"), "schema_drift")
+
+    critical_count = sum(1 for b in bug_spec if b.get("severity") == "critical")
+    if critical_count >= 3:
+        blast = "critical"
+    elif critical_count == 2:
+        blast = "high"
+    elif critical_count == 1:
+        blast = "medium"
+    else:
+        blast = "low"
+
+    hint_map = {
+        "silent_drop": "Row count anomaly detected. Check null ratio.",
+        "type_corruption": "Type validation failed. Check column dtypes.",
+        "schema_drift": "Schema mismatch vs upstream contract.",
+        "pii_leak": "Sensitive data detected in analytics output.",
+        "duplicate_aggregation": "Aggregation inflated. Check for duplicate rows.",
+        "swallowed_exception": "Job succeeded but output invalid. Check logs.",
+        "zombie_partition": "Partition exists but storage is 0 bytes.",
+    }
+
+    return FailureSignature(
+        failure_type=failure_type,
+        affected_stage=top_bug.get("stage", "stage_3_join"),
+        blast_radius=blast,
+        detection_hint=hint_map.get(failure_type, "Unknown failure pattern."),
+    )
+
+
+def build_metrics_facet(df, historical_avg: int = 200) -> "MetricsFacet":
+    """Build MetricsFacet from current DataFrame state."""
+    from env.models import MetricsFacet
+
+    null_ratio = float(df.isnull().sum().sum() / max(df.size, 1))
+    return MetricsFacet(
+        row_count=len(df),
+        historical_avg=historical_avg,
+        null_ratio=round(null_ratio, 4),
+        storage_bytes=len(df) * 64 if len(df) > 0 else 0,
+    )
+
+
+def build_logs_facet(error_list: list[str], status: str = "failed") -> "LogsFacet":
+    """Build LogsFacet from accumulated error messages."""
+    from env.models import LogsFacet
+
+    return LogsFacet(
+        recent_errors=error_list[-5:],
+        last_run_status=status,
+    )
+
+
 if __name__ == "__main__":
     from env.data.generator import generate_employee_dataset
 

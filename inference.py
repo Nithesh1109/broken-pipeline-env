@@ -29,29 +29,37 @@ from openai import OpenAI
 from env.models import ActionType
 
 
-# -- Environment variables -- raise immediately if missing ------------------
-API_BASE_URL = os.getenv("API_BASE_URL")
-MODEL_NAME = os.getenv("MODEL_NAME")
-HF_TOKEN = os.getenv("HF_TOKEN")
+def get_runtime_config() -> dict[str, str]:
+    """Load and validate runtime configuration lazily (import-safe)."""
+    api_base_url = os.getenv("API_BASE_URL")
+    if not api_base_url:
+        raise EnvironmentError(
+            "API_BASE_URL is not set. "
+            "Set it to your HF Space URL or http://localhost:8000"
+        )
 
-if not API_BASE_URL:
-    raise EnvironmentError(
-        "API_BASE_URL is not set. "
-        "Set it to your HF Space URL or http://localhost:8000"
-    )
-if not MODEL_NAME:
-    raise EnvironmentError(
-        "MODEL_NAME is not set. "
-        "Example: Qwen/Qwen2.5-72B-Instruct"
-    )
-if not HF_TOKEN:
-    raise EnvironmentError(
-        "HF_TOKEN is not set. "
-        "Set it to your Hugging Face token."
-    )
+    model_name = os.getenv("MODEL_NAME")
+    if not model_name:
+        raise EnvironmentError(
+            "MODEL_NAME is not set. "
+            "Example: Qwen/Qwen2.5-72B-Instruct"
+        )
 
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://router.huggingface.co/v1")
-client = OpenAI(api_key=HF_TOKEN, base_url=LLM_BASE_URL)
+    hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        raise EnvironmentError(
+            "HF_TOKEN is not set. "
+            "Set it to your Hugging Face token."
+        )
+
+    llm_base_url = os.getenv("LLM_BASE_URL", "https://router.huggingface.co/v1")
+
+    return {
+        "api_base_url": api_base_url,
+        "model_name": model_name,
+        "hf_token": hf_token,
+        "llm_base_url": llm_base_url,
+    }
 
 
 # -- Constants -------------------------------------------------------------
@@ -353,11 +361,11 @@ def _compaction_summary(belief_state: dict, step_errors: list[str]) -> str:
 
 
 # -- Episode loop ----------------------------------------------------------
-def run_episode(task_id: int) -> float:
+def run_episode(task_id: int, config: dict[str, str], client: OpenAI) -> float:
     _check_runtime()
 
     resp = http.post(
-        f"{API_BASE_URL}/reset",
+        f"{config['api_base_url']}/reset",
         params={"task_id": task_id},
         timeout=HTTP_TIMEOUT,
     )
@@ -400,7 +408,7 @@ def run_episode(task_id: int) -> float:
 
             try:
                 response = client.chat.completions.create(
-                    model=MODEL_NAME,
+                    model=config["model_name"],
                     messages=messages,
                     temperature=0.2,
                     max_tokens=512,
@@ -431,7 +439,7 @@ def run_episode(task_id: int) -> float:
 
         try:
             step_resp = http.post(
-                f"{API_BASE_URL}/step",
+                f"{config['api_base_url']}/step",
                 json=action,
                 params={"task_id": task_id},
                 timeout=HTTP_TIMEOUT,
@@ -469,7 +477,7 @@ def run_episode(task_id: int) -> float:
 
     try:
         grade_resp = http.get(
-            f"{API_BASE_URL}/grader",
+            f"{config['api_base_url']}/grader",
             params={"task_id": task_id},
             timeout=HTTP_TIMEOUT,
         )
@@ -497,7 +505,14 @@ def run_episode(task_id: int) -> float:
 
 
 # -- Entry point -----------------------------------------------------------
-if __name__ == "__main__":
+def main() -> None:
+    global _EPISODE_START
+    config = get_runtime_config()
+    client = OpenAI(
+        api_key=config["hf_token"],
+        base_url=config["llm_base_url"],
+    )
+
     _EPISODE_START = time.time()
     scores: dict[int, float] = {}
 
@@ -506,7 +521,7 @@ if __name__ == "__main__":
         print(f"  TASK {task_id}")
         print(f"{'=' * 65}")
         try:
-            scores[task_id] = run_episode(task_id)
+            scores[task_id] = run_episode(task_id, config, client)
         except Exception as exc:
             print(f"  [TASK {task_id} FAILED] {exc}")
             scores[task_id] = 0.0
@@ -525,3 +540,7 @@ if __name__ == "__main__":
     print(f"  Task 3: {scores.get(3, 0):.4f}")
     print(f"  Average: {avg:.4f}")
     print(f"{'=' * 65}")
+
+
+if __name__ == "__main__":
+    main()
