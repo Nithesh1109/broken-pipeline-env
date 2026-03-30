@@ -1,14 +1,17 @@
 """
-inference.py - DataPipelineEnv LLM Agent Loop (Member 2)
+inference.py - DataPipelineEnv Peak Agent Loop
 
-Architecture:
-  Observe -> Hypothesize -> Tool Call -> Update Belief -> Fix
+Architecture: Observe -> Hypothesize -> Tool Call -> Update Belief -> Fix -> Verify
 
-Memory: rolling window of last ROLLING_WINDOW message pairs.
-Self-correction: up to MAX_PARSE_RETRIES before NOOP fallback.
-Belief state: in-memory dict tracking candidate root causes.
-Context compaction: at step 6, inject compressed incident summary.
-PII sanitizer: redact SSN patterns from reasoning traces before logging.
+Features:
+- Rolling window memory (last 6 pairs)
+- BeliefState tracking (candidates, eliminated, confidence)
+- Self-correction retry (2 retries before NOOP)
+- Escalation summary at step 6
+- Context compaction at step 6
+- PII sanitizer on reasoning traces
+- Runtime guard (19 min hard limit)
+- Strict env var validation on startup
 """
 from __future__ import annotations
 
@@ -17,10 +20,13 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 import requests as http
 from openai import OpenAI
+
+from env.models import ActionType
 
 
 # -- Environment variables -- raise immediately if missing ------------------
@@ -29,14 +35,22 @@ MODEL_NAME = os.getenv("MODEL_NAME")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 if not API_BASE_URL:
-    raise EnvironmentError("API_BASE_URL is not set.")
+    raise EnvironmentError(
+        "API_BASE_URL is not set. "
+        "Set it to your HF Space URL or http://localhost:8000"
+    )
 if not MODEL_NAME:
-    raise EnvironmentError("MODEL_NAME is not set.")
+    raise EnvironmentError(
+        "MODEL_NAME is not set. "
+        "Example: Qwen/Qwen2.5-72B-Instruct"
+    )
 if not HF_TOKEN:
-    raise EnvironmentError("HF_TOKEN is not set.")
+    raise EnvironmentError(
+        "HF_TOKEN is not set. "
+        "Set it to your Hugging Face token."
+    )
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://router.huggingface.co/v1")
-
 client = OpenAI(api_key=HF_TOKEN, base_url=LLM_BASE_URL)
 
 
@@ -44,7 +58,7 @@ client = OpenAI(api_key=HF_TOKEN, base_url=LLM_BASE_URL)
 MAX_STEPS = 8
 MAX_PARSE_RETRIES = 2
 ROLLING_WINDOW = 6
-COMPACTION_STEP = 6
+COMPACTION_STEP = 5
 MAX_RUNTIME_SECS = 19 * 60
 HTTP_TIMEOUT = 30
 
@@ -60,210 +74,217 @@ VALID_ACTION_TYPES = {
 }
 
 FALLBACK_ACTION = {
-    "action_type": "NOOP",
+    "action_type": ActionType.NOOP.value,
     "target_column": None,
     "transformation": None,
-    "justification": "Fallback NOOP - could not parse valid action after retries.",
+    "justification": "Fallback NOOP - could not parse valid action.",
     "identified_issues": None,
 }
+
+_EPISODE_START: float = 0.0
 
 _SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}")
 
-_EPISODE_START: float = 0.0
+
+# -- Belief state ----------------------------------------------------------
+@dataclass
+class BeliefState:
+    candidate_causes: list[str] = field(default_factory=list)
+    eliminated_causes: list[str] = field(default_factory=list)
+    confirmed_fixes: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    signals_unlocked: list[str] = field(default_factory=list)
+    step_errors: list[str] = field(default_factory=list)
+
+    def to_prompt_str(self) -> str:
+        lines = []
+        if self.candidate_causes:
+            lines.append(f"Candidates: {self.candidate_causes}")
+        if self.eliminated_causes:
+            lines.append(f"Eliminated: {self.eliminated_causes}")
+        if self.confirmed_fixes:
+            lines.append(f"Fixed so far: {self.confirmed_fixes}")
+        if self.confidence > 0:
+            lines.append(f"Confidence: {self.confidence:.2f}")
+        return " | ".join(lines) if lines else "No hypothesis yet."
+
+    def update_confidence(self, reward: float):
+        """Bayesian-lite confidence update from step reward."""
+        delta = 0.15 if reward > 0.1 else (-0.10 if reward < 0 else 0.0)
+        self.confidence = round(max(0.0, min(1.0, self.confidence + delta)), 3)
 
 
 # -- System prompt ---------------------------------------------------------
 SYSTEM_PROMPT = """You are a senior data engineer on call.
-A production data pipeline is broken. Investigate systematically.
+A production data pipeline is broken. CEO is asking about revenue numbers.
+Investigate systematically before fixing anything.
 
-STRATEGY:
-  Step 1-2: INSPECT to gather evidence (use target_column to unlock facets:
-            \"logs\", \"metrics\", \"dag\", \"pii\", or a specific column name)
-  Step 3-5: Apply targeted fixes based on what you found
-  Step 6+:  VALIDATE to confirm fixes, then confirm pipeline health
+OPTIMAL STRATEGY:
+  Steps 1-2: INSPECT to unlock evidence facets
+             target_column options: "logs", "metrics", "dag", "pii", or a column name
+  Steps 3-5: Apply targeted fixes based on evidence
+  Steps 6-7: VALIDATE to confirm fixes
+  Step 8:    Final VALIDATE or MASK_PII if PII still exposed
 
-OUTPUT FORMAT - reply ONLY with valid JSON, no markdown fences, no explanation:
+CRITICAL RULES:
+  - If you see SSN data anywhere -> MASK_PII on "ssn" IMMEDIATELY
+  - Never DROP_COLUMN without seeing the schema first
+  - Always explain your reasoning in justification
+
+OUTPUT: Reply ONLY with valid JSON, zero markdown, zero explanation:
 {
-  \"action_type\": \"INSPECT\"|\"RENAME_COLUMN\"|\"CAST_TYPE\"|\"FILL_DEFAULT\"|
-                 \"DROP_COLUMN\"|\"VALIDATE\"|\"MASK_PII\"|\"NOOP\",
-  \"target_column\": \"column_name\" or null,
-  \"transformation\": \"cast_to_int\"|\"cast_to_float\"|\"fill_median\"|
-                    \"fill_zero\"|\"drop_duplicates\" or null,
-  \"justification\": \"One sentence: what you observed and why this action.\",
-  \"identified_issues\": [
+  "action_type": "INSPECT"|"RENAME_COLUMN"|"CAST_TYPE"|"FILL_DEFAULT"|
+                 "DROP_COLUMN"|"VALIDATE"|"MASK_PII"|"NOOP",
+  "target_column": "column_name" or null,
+  "transformation": "cast_to_int"|"cast_to_float"|"fill_median"|
+                    "fill_zero"|"drop_duplicates" or null,
+  "justification": "One sentence: what you observed and why this action.",
+  "identified_issues": [
     {
-      \"issue_type\": \"null_injection\"|\"type_corruption\"|\"out_of_range\"|
-                    \"format_inconsistency\"|\"schema_drift\"|\"pii_leak\"|
-                    \"duplicate_rows\",
-      \"column\": \"column_name\" or null,
-      \"description\": \"what you found\",
-      \"severity\": \"low\"|\"medium\"|\"high\"|\"critical\"
+      "issue_type": "null_injection"|"type_corruption"|"out_of_range"|
+                    "format_inconsistency"|"schema_drift"|"pii_leak"|
+                    "duplicate_rows",
+      "column": "column_name" or null,
+      "description": "what you found",
+      "severity": "low"|"medium"|"high"|"critical"
     }
   ] or null
-}
-
-RULES:
-- Always include justification explaining your reasoning
-- On INSPECT, populate identified_issues with everything you observe
-- If you see SSN data anywhere, immediately use MASK_PII on \"ssn\"
-- Never DROP_COLUMN without checking dependencies first
-- After all fixes, use VALIDATE to confirm"""
+}"""
 
 
 # -- Utility functions -----------------------------------------------------
+def _check_runtime():
+    if time.time() - _EPISODE_START > MAX_RUNTIME_SECS:
+        print(f"\n[TIMEOUT] Exceeded {MAX_RUNTIME_SECS // 60}min. Stopping.")
+        sys.exit(1)
+
 
 def _sanitize_pii(text: str) -> str:
-    """Redact SSN and email patterns from reasoning traces before logging."""
     text = _SSN_RE.sub("[SSN-REDACTED]", text)
     text = _EMAIL_RE.sub("[EMAIL-REDACTED]", text)
     return text
 
 
-def _check_runtime():
-    """Raise SystemExit if total elapsed time exceeds limit."""
-    if time.time() - _EPISODE_START > MAX_RUNTIME_SECS:
-        print(f"\n[TIMEOUT] Exceeded {MAX_RUNTIME_SECS//60}min limit. Stopping.")
-        sys.exit(1)
-
-
-def _observation_to_prompt(obs: dict, belief_state: dict, step_num: int) -> str:
-    """
-    Convert DataObservation dict to LLM prompt string.
-    Includes belief state (candidate root causes) for hypothesis tracking.
-    """
-    lines = [
-        f"=== STEP {step_num + 1}/{MAX_STEPS} ===",
-        f"Pipeline stage  : {obs.get('pipeline_stage', 'UNKNOWN')}",
-        f"Steps remaining : {obs.get('time_remaining', 0)}",
-        f"Downstream health: {obs.get('downstream_health', 0):.2f}",
-    ]
-
-    visible = obs.get("visible_signals") or {}
-    if visible.get("alert"):
-        a = visible["alert"]
-        lines.append(f"\n[ALERT] severity={a.get('severity')} risk={a.get('risk_score',0):.2f}")
-        lines.append(f"  {a.get('message','')}")
-    if visible.get("logs"):
-        lg = visible["logs"]
-        lines.append(f"\n[LOGS] status={lg.get('last_run_status')}")
-        for err in (lg.get("recent_errors") or [])[:3]:
-            lines.append(f"  ERROR: {err}")
-    if visible.get("metrics"):
-        m = visible["metrics"]
-        lines.append(
-            f"\n[METRICS] rows={m.get('row_count')} avg={m.get('historical_avg')} "
-            f"null_ratio={m.get('null_ratio',0):.3f}"
-        )
-    if visible.get("compliance"):
-        c = visible["compliance"]
-        lines.append(
-            f"\n[COMPLIANCE] pii_detected={c.get('pii_detected')} "
-            f"risky_cols={c.get('risky_columns')}"
-        )
-
-    lines.append(f"\nSchema:\n{json.dumps(obs.get('schema', {}), indent=2)}")
-    lines.append(f"\nDataset preview (first 5 rows):\n{json.dumps(obs.get('dataset_preview', [])[:5], indent=2)}")
-
-    if obs.get("validation_report"):
-        lines.append(f"\nOpen issues:\n{json.dumps(obs['validation_report'], indent=2)}")
-
-    if belief_state.get("candidates"):
-        lines.append(f"\n[BELIEF STATE] Candidate root causes: {belief_state['candidates']}")
-    if belief_state.get("confirmed"):
-        lines.append(f"[BELIEF STATE] Confirmed: {belief_state['confirmed']}")
-
-    lines.append("\nWhat is your next action?")
-    return "\n".join(lines)
-
-
-def _compaction_summary(belief_state: dict, step_errors: list[str]) -> str:
-    """
-    At step COMPACTION_STEP, inject a compressed incident summary.
-    Replaces verbose older observations with a concise fact sheet.
-    Saves ~40% token cost on remaining steps.
-    """
-    candidates = belief_state.get("candidates", ["unknown"])
-    confirmed = belief_state.get("confirmed", [])
-    fixes_done = belief_state.get("fixes_done", [])
-
-    return (
-        f"[INCIDENT FACT SHEET - Step {COMPACTION_STEP} Summary]\n"
-        f"Candidate root causes identified: {candidates}\n"
-        f"Confirmed failures: {confirmed}\n"
-        f"Fixes applied so far: {fixes_done}\n"
-        f"Recent errors: {step_errors[-3:] if step_errors else ['none']}\n"
-        f"--- Continue investigation or validate if all issues resolved ---"
-    )
-
-
-def _truncate_messages(messages: list[dict], system_msg: dict) -> list[dict]:
-    """
-    Keep only last ROLLING_WINDOW user+assistant pairs.
-    System message always preserved at index 0.
-    """
-    non_system = [m for m in messages if m["role"] != "system"]
-    if len(non_system) > ROLLING_WINDOW * 2:
-        non_system = non_system[-(ROLLING_WINDOW * 2) :]
-    return [system_msg] + non_system
-
-
 def _parse_json_from_text(text: str) -> Optional[dict]:
-    """
-    Extract JSON from LLM output. Handles:
-    - clean JSON
-    - ```json ... ``` fences
-    - ``` ... ``` fences
-    - JSON embedded in prose
-    """
     text = text.strip()
-
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if fence_match:
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if fence:
         try:
-            return json.loads(fence_match.group(1).strip())
+            return json.loads(fence.group(1).strip())
         except json.JSONDecodeError:
             pass
 
-    brace_match = re.search(r"\{[\s\S]*\}", text)
-    if brace_match:
+    brace = re.search(r"\{[\s\S]*\}", text)
+    if brace:
         try:
-            return json.loads(brace_match.group(0))
+            return json.loads(brace.group(0))
         except json.JSONDecodeError:
             pass
 
     return None
 
 
-def _validate_action(action_dict: dict) -> bool:
-    """Validate parsed action has required fields and valid action_type."""
-    if not isinstance(action_dict, dict):
+def _validate_action(action: Optional[dict]) -> bool:
+    if not isinstance(action, dict):
         return False
-    if action_dict.get("action_type") not in VALID_ACTION_TYPES:
+    if action.get("action_type") not in VALID_ACTION_TYPES:
         return False
-    if not action_dict.get("justification"):
+    if not action.get("justification"):
         return False
     return True
 
 
-def _update_belief_state(belief: dict, action: dict, result: dict) -> dict:
-    """
-    Update belief state from action and step result.
-    Tracks candidate root causes and confirmed fixes.
-    """
-    action_type = action.get("action_type", "NOOP")
-    target = action.get("target_column")
-    justif = _sanitize_pii(action.get("justification", ""))
-    reward = result.get("reward", 0.0)
-    info = result.get("info", {})
+def _truncate_messages(messages: list[dict], system_msg: dict) -> list[dict]:
+    non_sys = [m for m in messages if m["role"] != "system"]
+    if len(non_sys) > ROLLING_WINDOW * 2:
+        non_sys = non_sys[-(ROLLING_WINDOW * 2) :]
+    return [system_msg] + non_sys
 
-    identified = info.get("identified", [])
-    fixed = info.get("fixed", [])
+
+def _build_escalation_summary(belief: BeliefState, step_num: int) -> str:
+    """
+    At step 6, inject compressed incident summary.
+    Replaces verbose history. Focuses agent on resolution.
+    Saves token cost for remaining steps.
+    """
+    return (
+        f"[ESCALATION SUMMARY - Step {step_num + 1}]\n"
+        f"Root cause hypothesis: {belief.candidate_causes or ['undetermined']}\n"
+        f"Eliminated: {belief.eliminated_causes or ['none']}\n"
+        f"Fixes confirmed: {belief.confirmed_fixes or ['none']}\n"
+        f"Confidence: {belief.confidence:.2f}\n"
+        f"Signals unlocked: {belief.signals_unlocked or ['none']}\n"
+        f"Recent errors: {belief.step_errors[-3:] or ['none']}\n"
+        f"--- You have {MAX_STEPS - step_num - 1} steps left. "
+        f"If all fixes applied, use VALIDATE. "
+        f"If PII exposed, use MASK_PII on 'ssn' immediately. ---"
+    )
+
+
+def _observation_to_prompt(obs: dict, belief: BeliefState, step_num: int) -> str:
+    lines = [
+        f"=== STEP {step_num + 1}/{MAX_STEPS} ===",
+        f"Stage: {obs.get('pipeline_stage', '?')} | "
+        f"Remaining: {obs.get('time_remaining', 0)} | "
+        f"Health: {obs.get('downstream_health', 0):.2f}",
+    ]
+
+    vis = obs.get("visible_signals") or {}
+    alert = vis.get("alert")
+    if alert:
+        lines.append(
+            f"\n[ALERT] {alert.get('severity', '?').upper()} "
+            f"risk={alert.get('risk_score', 0):.2f}: {alert.get('message', '')}"
+        )
+
+    logs = vis.get("logs")
+    if logs:
+        lines.append(f"\n[LOGS] status={logs.get('last_run_status', '?')}")
+        for err in (logs.get("recent_errors") or [])[:3]:
+            lines.append(f"  x {err}")
+
+    metrics = vis.get("metrics")
+    if metrics:
+        lines.append(
+            f"\n[METRICS] rows={metrics.get('row_count')} "
+            f"avg={metrics.get('historical_avg')} "
+            f"null_ratio={metrics.get('null_ratio', 0):.3f}"
+        )
+
+    compliance = vis.get("compliance")
+    if compliance:
+        lines.append(
+            f"\n[COMPLIANCE] pii_detected={compliance.get('pii_detected')} "
+            f"risky={compliance.get('risky_columns')}"
+        )
+
+    lines.append(f"\nSchema:\n{json.dumps(obs.get('schema', {}), indent=2)}")
+    preview = obs.get("dataset_preview", [])[:5]
+    lines.append(f"\nDataset preview (5 rows):\n{json.dumps(preview, indent=2)}")
+
+    if obs.get("validation_report"):
+        lines.append(f"\nOpen issues:\n{json.dumps(obs['validation_report'], indent=2)}")
+
+    belief_str = belief.to_prompt_str()
+    if belief_str != "No hypothesis yet.":
+        lines.append(f"\n[BELIEF STATE] {belief_str}")
+
+    lines.append("\nWhat is your next action?")
+    return "\n".join(lines)
+
+
+def _update_belief(belief: BeliefState, action: dict, result: dict) -> BeliefState:
+    action_type = action.get("action_type", ActionType.NOOP.value)
+    target = action.get("target_column", "") or ""
+    justif = _sanitize_pii(action.get("justification", "")).lower()
+    reward = float(result.get("reward", 0.0))
+    info = result.get("info", {})
 
     keywords = [
         "stage 3",
@@ -277,64 +298,93 @@ def _update_belief_state(belief: dict, action: dict, result: dict) -> dict:
         "duplicate",
         "join",
     ]
-    found = [kw for kw in keywords if kw in justif.lower()]
-    if found:
-        belief.setdefault("candidates", [])
-        for item in found:
-            if item not in belief["candidates"]:
-                belief["candidates"].append(item)
 
-    if reward > 0.1 and action_type not in ("INSPECT", "NOOP"):
-        belief.setdefault("confirmed", [])
-        if target and target not in belief["confirmed"]:
-            belief["confirmed"].append(f"{action_type}:{target}")
+    for kw in keywords:
+        if kw in justif and kw not in belief.candidate_causes:
+            belief.candidate_causes.append(kw)
 
-    belief["fixes_done"] = list(fixed)
-    belief["issues_identified"] = list(identified)
+    if reward < -0.05 and target:
+        attempt = f"{action_type}:{target}"
+        if attempt not in belief.eliminated_causes:
+            belief.eliminated_causes.append(attempt)
 
-    if info.get("signals_unlocked"):
-        belief["signals_unlocked"] = info["signals_unlocked"]
+    for bug_id in info.get("fixed", []):
+        if bug_id not in belief.confirmed_fixes:
+            belief.confirmed_fixes.append(bug_id)
 
+    for sig in info.get("signals_unlocked", []):
+        if sig not in belief.signals_unlocked:
+            belief.signals_unlocked.append(sig)
+
+    belief.update_confidence(reward)
     return belief
 
 
-# -- Main episode loop -----------------------------------------------------
-def run_episode(task_id: int) -> float:
-    """
-    Run one full episode for a task.
+# Compatibility shims for existing tests and imports
 
-    Loop: Observe -> Hypothesize -> Tool Call -> Update Belief -> Fix
-    Memory: rolling window of ROLLING_WINDOW message pairs
-    Self-correction: up to MAX_PARSE_RETRIES before NOOP
-    Compaction: inject summary at COMPACTION_STEP
-    """
+def _update_belief_state(belief: dict, action: dict, result: dict) -> dict:
+    state = BeliefState(
+        candidate_causes=list(belief.get("candidates", [])),
+        eliminated_causes=list(belief.get("eliminated", [])),
+        confirmed_fixes=list(belief.get("fixes_done", [])),
+        confidence=float(belief.get("confidence", 0.0)),
+        signals_unlocked=list(belief.get("signals_unlocked", [])),
+    )
+    updated = _update_belief(state, action, result)
+    belief["candidates"] = list(updated.candidate_causes)
+    belief["eliminated"] = list(updated.eliminated_causes)
+    belief["fixes_done"] = list(updated.confirmed_fixes)
+    belief["signals_unlocked"] = list(updated.signals_unlocked)
+    belief["confidence"] = float(updated.confidence)
+    return belief
+
+
+def _compaction_summary(belief_state: dict, step_errors: list[str]) -> str:
+    state = BeliefState(
+        candidate_causes=list(belief_state.get("candidates", [])),
+        eliminated_causes=list(belief_state.get("eliminated", [])),
+        confirmed_fixes=list(belief_state.get("confirmed", []))
+        + list(belief_state.get("fixes_done", [])),
+        confidence=float(belief_state.get("confidence", 0.0)),
+        signals_unlocked=list(belief_state.get("signals_unlocked", [])),
+        step_errors=list(step_errors),
+    )
+    return _build_escalation_summary(state, COMPACTION_STEP)
+
+
+# -- Episode loop ----------------------------------------------------------
+def run_episode(task_id: int) -> float:
     _check_runtime()
 
-    resp = http.post(f"{API_BASE_URL}/reset", params={"task_id": task_id}, timeout=HTTP_TIMEOUT)
+    resp = http.post(
+        f"{API_BASE_URL}/reset",
+        params={"task_id": task_id},
+        timeout=HTTP_TIMEOUT,
+    )
     resp.raise_for_status()
     obs = resp.json()
-
-    if "info" in obs:
-        obs["visible_signals"] = obs["info"].get("visible_signals", {})
+    obs["visible_signals"] = obs.get("info", {}).get("visible_signals", {})
 
     system_msg = {"role": "system", "content": SYSTEM_PROMPT}
     messages = [system_msg]
-    belief_state: dict = {"candidates": [], "confirmed": [], "fixes_done": []}
-    step_errors: list[str] = []
+    belief = BeliefState()
 
     for step_num in range(MAX_STEPS):
         _check_runtime()
 
         if step_num == COMPACTION_STEP:
-            summary = _compaction_summary(belief_state, step_errors)
-            non_system = [m for m in messages if m["role"] != "system"]
-            last_two = non_system[-2:] if len(non_system) >= 2 else non_system
+            summary = _build_escalation_summary(belief, step_num)
+            non_sys = [m for m in messages if m["role"] != "system"]
+            last_two = non_sys[-2:] if len(non_sys) >= 2 else non_sys
             messages = [system_msg, {"role": "user", "content": summary}] + last_two
-            print(f"  [COMPACTION] Injected incident summary at step {step_num+1}")
+            print(
+                f"  [ESCALATION] Injected summary - "
+                f"confidence={belief.confidence:.2f} "
+                f"candidates={belief.candidate_causes}"
+            )
 
-        user_content = _observation_to_prompt(obs, belief_state, step_num)
-        messages.append({"role": "user", "content": user_content})
-
+        user_msg = _observation_to_prompt(obs, belief, step_num)
+        messages.append({"role": "user", "content": user_msg})
         messages = _truncate_messages(messages, system_msg)
 
         action = None
@@ -342,12 +392,11 @@ def run_episode(task_id: int) -> float:
 
         for attempt in range(MAX_PARSE_RETRIES + 1):
             if attempt > 0:
-                correction_msg = (
-                    f"Your previous response was invalid: {last_error}\n"
-                    f"Please reply with ONLY valid JSON matching the schema. "
-                    f"No markdown, no explanation."
+                correction = (
+                    f"Your previous output was invalid: {last_error}. "
+                    f"Reply ONLY with valid JSON. No markdown. No text."
                 )
-                messages.append({"role": "user", "content": correction_msg})
+                messages.append({"role": "user", "content": correction})
 
             try:
                 response = client.chat.completions.create(
@@ -358,27 +407,27 @@ def run_episode(task_id: int) -> float:
                 )
                 raw = response.choices[0].message.content or ""
             except Exception as exc:
-                last_error = f"LLM call failed: {exc}"
-                step_errors.append(last_error)
+                last_error = str(exc)
+                belief.step_errors.append(f"LLM error: {exc}")
                 print(f"  [LLM ERROR] {exc}")
                 raw = ""
 
             parsed = _parse_json_from_text(raw) if raw else None
-
             if parsed and _validate_action(parsed):
                 action = parsed
                 messages.append({"role": "assistant", "content": raw})
                 break
-            else:
-                last_error = (
-                    f"Invalid action_type '{parsed.get('action_type') if parsed else 'none'}' "
-                    f"or missing justification"
-                )
+
+            last_error = (
+                f"Invalid action_type "
+                f"'{parsed.get('action_type') if parsed else 'none'}' "
+                f"or missing justification"
+            )
 
         if action is None:
             action = FALLBACK_ACTION
             messages.append({"role": "assistant", "content": json.dumps(FALLBACK_ACTION)})
-            print(f"  [FALLBACK] Using NOOP after {MAX_PARSE_RETRIES} retries")
+            print(f"  [FALLBACK] NOOP after {MAX_PARSE_RETRIES} retries")
 
         try:
             step_resp = http.post(
@@ -391,35 +440,39 @@ def run_episode(task_id: int) -> float:
             result = step_resp.json()
         except Exception as exc:
             print(f"  [STEP ERROR] {exc}")
-            step_errors.append(str(exc))
+            belief.step_errors.append(str(exc))
             break
 
         obs = result.get("observation", obs)
         done = result.get("done", False)
         reward = float(result.get("reward", 0.0))
+        info = result.get("info", {})
+        obs["visible_signals"] = info.get("visible_signals", {})
 
-        step_info = result.get("info", {})
-        obs["visible_signals"] = step_info.get("visible_signals", {})
+        belief = _update_belief(belief, action, result)
 
-        belief_state = _update_belief_state(belief_state, action, result)
-
-        justif_short = _sanitize_pii(action.get("justification", ""))[:60]
+        justif_short = _sanitize_pii(action.get("justification", ""))[:55]
         print(
-            f"  Step {step_num+1:02d} | "
+            f"  Step {step_num + 1:02d} | "
             f"{action['action_type']:15s} | "
-            f"target={str(action.get('target_column',''))[:12]:12s} | "
+            f"target={str(action.get('target_column', ''))[:10]:10s} | "
             f"reward={reward:+.3f} | "
-            f"health={obs.get('downstream_health',0):.2f} | "
-            f"done={done} | "
-            f"'{justif_short}...'"
+            f"health={obs.get('downstream_health', 0):.2f} | "
+            f"conf={belief.confidence:.2f} | "
+            f"done={done}"
         )
+        print(f"          '{justif_short}...'")
 
         if done:
-            print(f"  [DONE] Episode completed at step {step_num+1}")
+            print(f"  [DONE] Completed at step {step_num + 1}")
             break
 
     try:
-        grade_resp = http.get(f"{API_BASE_URL}/grader", params={"task_id": task_id}, timeout=HTTP_TIMEOUT)
+        grade_resp = http.get(
+            f"{API_BASE_URL}/grader",
+            params={"task_id": task_id},
+            timeout=HTTP_TIMEOUT,
+        )
         grade_resp.raise_for_status()
         grade = grade_resp.json()
     except Exception as exc:
@@ -430,12 +483,15 @@ def run_episode(task_id: int) -> float:
     breakdown = grade.get("breakdown", {})
     explanation = grade.get("explanation", "")
 
-    print(f"\n  GRADER BREAKDOWN: {json.dumps(breakdown, indent=4)}")
-    print(f"  EXPLANATION: {explanation}")
-    print(
-        f"  BELIEF STATE: candidates={belief_state.get('candidates')} "
-        f"confirmed={belief_state.get('confirmed')}"
-    )
+    print("\n  GRADER:")
+    for key, value in breakdown.items():
+        print(f"    {key:30s} = {value}")
+    print(f"  {explanation}")
+    print("\n  BeliefState final:")
+    print(f"    candidates  = {belief.candidate_causes}")
+    print(f"    confirmed   = {belief.confirmed_fixes}")
+    print(f"    confidence  = {belief.confidence:.2f}")
+    print(f"    signals     = {belief.signals_unlocked}")
 
     return score
 
@@ -443,13 +499,12 @@ def run_episode(task_id: int) -> float:
 # -- Entry point -----------------------------------------------------------
 if __name__ == "__main__":
     _EPISODE_START = time.time()
-
     scores: dict[int, float] = {}
 
     for task_id in [1, 2, 3]:
-        print(f"\n{'='*65}")
+        print(f"\n{'=' * 65}")
         print(f"  TASK {task_id}")
-        print(f"{'='*65}")
+        print(f"{'=' * 65}")
         try:
             scores[task_id] = run_episode(task_id)
         except Exception as exc:
@@ -457,13 +512,16 @@ if __name__ == "__main__":
             scores[task_id] = 0.0
 
         elapsed = time.time() - _EPISODE_START
-        print(f"  -> Score: {scores[task_id]:.4f}  (total elapsed: {elapsed:.0f}s / {MAX_RUNTIME_SECS}s)")
+        print(
+            f"\n  -> Task {task_id} Score: {scores[task_id]:.4f} "
+            f"(elapsed: {elapsed:.0f}s/{MAX_RUNTIME_SECS}s)"
+        )
 
     avg = sum(scores.values()) / 3
-    print(f"\n{'='*65}")
-    print("  FINAL SCORES")
-    print(f"  Task 1: {scores.get(1,0):.4f}")
-    print(f"  Task 2: {scores.get(2,0):.4f}")
-    print(f"  Task 3: {scores.get(3,0):.4f}")
+    print(f"\n{'=' * 65}")
+    print("  FINAL RESULTS")
+    print(f"  Task 1: {scores.get(1, 0):.4f}")
+    print(f"  Task 2: {scores.get(2, 0):.4f}")
+    print(f"  Task 3: {scores.get(3, 0):.4f}")
     print(f"  Average: {avg:.4f}")
-    print(f"{'='*65}")
+    print(f"{'=' * 65}")

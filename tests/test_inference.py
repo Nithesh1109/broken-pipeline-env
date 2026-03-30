@@ -311,3 +311,218 @@ class TestInference:
         with pytest.raises(SystemExit):
             inf._check_runtime()
         inf._EPISODE_START = original
+
+
+class TestBeliefState:
+    def test_confidence_increases_on_positive_reward(self):
+        from inference import BeliefState
+
+        belief = BeliefState()
+        belief.update_confidence(0.20)
+        assert belief.confidence > 0.0
+
+    def test_confidence_decreases_on_negative_reward(self):
+        from inference import BeliefState
+
+        belief = BeliefState(confidence=0.5)
+        belief.update_confidence(-0.10)
+        assert belief.confidence < 0.5
+
+    def test_confidence_clamped_at_1(self):
+        from inference import BeliefState
+
+        belief = BeliefState(confidence=0.99)
+        belief.update_confidence(0.20)
+        assert belief.confidence <= 1.0
+
+    def test_confidence_clamped_at_0(self):
+        from inference import BeliefState
+
+        belief = BeliefState(confidence=0.01)
+        belief.update_confidence(-0.10)
+        assert belief.confidence >= 0.0
+
+    def test_to_prompt_str_empty(self):
+        from inference import BeliefState
+
+        belief = BeliefState()
+        assert belief.to_prompt_str() == "No hypothesis yet."
+
+    def test_to_prompt_str_with_data(self):
+        from inference import BeliefState
+
+        belief = BeliefState(
+            candidate_causes=["schema drift"],
+            confirmed_fixes=["B001"],
+            confidence=0.75,
+        )
+        prompt_str = belief.to_prompt_str()
+        assert "schema drift" in prompt_str
+        assert "B001" in prompt_str
+
+    def test_belief_update_adds_candidates(self):
+        from inference import BeliefState, _update_belief
+
+        belief = BeliefState()
+        action = {
+            "action_type": "INSPECT",
+            "target_column": "logs",
+            "justification": "I suspect schema drift at stage 3 join",
+        }
+        result = {
+            "reward": 0.15,
+            "info": {
+                "fixed": [],
+                "identified": [],
+                "signals_unlocked": ["logs"],
+            },
+        }
+        updated = _update_belief(belief, action, result)
+        assert "schema drift" in updated.candidate_causes
+        assert "logs" in updated.signals_unlocked
+
+    def test_belief_update_records_eliminated(self):
+        from inference import BeliefState, _update_belief
+
+        belief = BeliefState()
+        action = {
+            "action_type": "DROP_COLUMN",
+            "target_column": "name",
+            "justification": "dropping name column",
+        }
+        result = {
+            "reward": -0.10,
+            "info": {
+                "fixed": [],
+                "identified": [],
+                "signals_unlocked": [],
+            },
+        }
+        updated = _update_belief(belief, action, result)
+        assert "DROP_COLUMN:name" in updated.eliminated_causes
+
+
+class TestEscalation:
+    def test_escalation_summary_contains_key_fields(self):
+        from inference import BeliefState, _build_escalation_summary
+
+        belief = BeliefState(
+            candidate_causes=["pii leak"],
+            confirmed_fixes=["B001"],
+            confidence=0.6,
+        )
+        summary = _build_escalation_summary(belief, step_num=5)
+        assert "pii leak" in summary
+        assert "B001" in summary
+        assert "0.60" in summary
+        assert "2 steps left" in summary or "steps left" in summary
+
+
+class TestGrader1Efficiency:
+    def test_efficiency_bonus_when_all_fixed_early(self):
+        env = Task1AuditEnv()
+        env.reset()
+
+        for bug in env.ground_truth:
+            env.identified_bug_ids.add(bug["bug_id"])
+            env.fixed_bug_ids.add(bug["bug_id"])
+
+        env.step_count = 3
+        result = grade_task1(env)
+        assert result.breakdown["efficiency_bonus"] > 0.0
+        assert result.score > 0.999
+
+    def test_no_efficiency_bonus_when_bugs_remain(self):
+        env = Task1AuditEnv()
+        env.reset()
+        result = grade_task1(env)
+        assert result.breakdown["efficiency_bonus"] == 0.0
+
+
+class TestGrader2TypeCorrectness:
+    def test_type_correctness_in_breakdown(self):
+        env = Task2SchemaEnv()
+        env.reset()
+        result = grade_task2(env)
+        assert "type_correctness" in result.breakdown
+        assert "column_recovery" in result.breakdown
+        assert 0.0 <= result.score <= 1.0
+
+
+class TestGrader3Bonuses:
+    def test_all_bonuses_in_breakdown(self):
+        env = Task3IncidentEnv()
+        env.reset()
+        result = grade_task3(env)
+        for key in [
+            "reasoning_bonus",
+            "root_cause_attribution",
+            "signals_investigation",
+            "efficiency_bonus",
+            "total_bonus",
+        ]:
+            assert key in result.breakdown, f"Missing: {key}"
+
+    def test_root_cause_attribution_exact_keyword(self):
+        from env.graders.grader3 import _root_cause_attribution
+
+        env = Task3IncidentEnv()
+        env.reset()
+        env.aer_history = [
+            AERRecord(
+                step_id=1,
+                action_type="INSPECT",
+                target="logs",
+                justification="Corruption at stage_3_join identified clearly.",
+                reward_earned=0.25,
+                issues_identified=[],
+                issues_fixed=[],
+            )
+        ]
+        bonus = _root_cause_attribution(env)
+        assert bonus == 0.05
+
+    def test_signals_bonus_scales_with_unlocked(self):
+        from env.graders.grader3 import _signals_investigation_bonus
+
+        env = Task3IncidentEnv()
+        env.reset()
+        env.signals_unlocked = {"logs", "metrics", "compliance", "dag"}
+        bonus = _signals_investigation_bonus(env)
+        assert bonus == pytest.approx(0.08)
+
+    def test_pii_penalty_is_not_100(self):
+        """CRITICAL: verify PII penalty never returns -100 (DQ violation)."""
+        env = Task3IncidentEnv()
+        env.reset()
+        result = grade_task3(env)
+        assert result.score >= 0.0, "Score must never go below 0.0"
+        assert result.breakdown["pii_compliance_penalty"] == pytest.approx(-0.20)
+        assert result.breakdown["pii_compliance_penalty"] != -100.0
+
+    def test_perfect_agent_scores_above_09(self):
+        env = Task3IncidentEnv()
+        env.reset()
+        env.diagnosis_correct = True
+        env.fix_applied = True
+        env.pii_masked = True
+        env.validation_passed = True
+        env.step_count = 3
+        env.signals_unlocked = {"logs", "metrics", "compliance", "dag"}
+        env.aer_history = [
+            AERRecord(
+                step_id=1,
+                action_type="INSPECT",
+                target="logs",
+                justification=(
+                    "I see schema drift at stage_3_join. "
+                    "SSN data leaked. Revenue type mismatch. "
+                    "Aggregation inflated."
+                ),
+                reward_earned=0.25,
+                issues_identified=[],
+                issues_fixed=[],
+            )
+        ]
+        result = grade_task3(env)
+        assert result.score >= 0.90, f"Perfect agent scored {result.score}"
