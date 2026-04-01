@@ -4,9 +4,26 @@ from pathlib import Path
 
 import pandas as pd
 
-from env.data.bug_injector import inject_bugs, load_scenario
+from env.data.bug_injector import (
+    build_logs_facet,
+    build_metrics_facet,
+    get_failure_signature,
+    inject_bugs,
+    load_scenario,
+)
 from env.data.generator import generate_employee_dataset
-from env.models import ActionType, DataAction, DataObservation, DetectedIssue, StepResult
+from env.models import (
+    AERRecord,
+    ActionType,
+    AlertSignal,
+    ComplianceFacet,
+    DataAction,
+    DataObservation,
+    DetectedIssue,
+    MetricsFacet,
+    StepResult,
+    VisibleSignals,
+)
 
 
 class Task3IncidentEnv:
@@ -38,6 +55,11 @@ class Task3IncidentEnv:
 
         self.pipeline_stage_health: dict[str, float] = {}
         self.downstream_health: float = 0.0
+        self.zombie_partition_active: bool = False
+        self.silent_drop_active: bool = False
+        self.visible_signals: VisibleSignals | None = None
+        self.signals_unlocked: set[str] = set()
+        self.aer_history: list[AERRecord] = []
 
     def reset(self) -> DataObservation:
         """Reset state, build deterministic dataset, inject bugs, and return observation."""
@@ -51,6 +73,24 @@ class Task3IncidentEnv:
         self.fix_applied = False
         self.pii_masked = False
         self.validation_passed = False
+        self.zombie_partition_active = False
+        self.silent_drop_active = False
+
+        for bug in self.ground_truth:
+            if bug["type"] == "duplicate_rows":
+                self.silent_drop_active = True
+            if bug["type"] == "pii_leak":
+                self.zombie_partition_active = True
+
+        failure_sig = get_failure_signature(self.ground_truth)
+        initial_alert = AlertSignal(
+            severity="critical",
+            message=f"PRODUCTION INCIDENT: {failure_sig.detection_hint}",
+            risk_score=0.91,
+        )
+        self.visible_signals = VisibleSignals(alert=initial_alert)
+        self.signals_unlocked = set()
+        self.aer_history = []
 
         self.pipeline_stage_health = {
             "stage_1_ingest": 1.0,
@@ -67,17 +107,51 @@ class Task3IncidentEnv:
         reward = 0.0
         done = False
 
-        justification_lower = action.justification.lower()
-        keyword_hits = sum(1 for kw in self.CORRECT_DIAGNOSIS_KEYWORDS if kw in justification_lower)
-        target_relevant = action.target_column in ["rev_amt", "revenue_amount", "ssn", None]
-
         if action.action_type == ActionType.INSPECT:
+            justification_lower = action.justification.lower()
+            keyword_hits = sum(1 for kw in self.CORRECT_DIAGNOSIS_KEYWORDS if kw in justification_lower)
+            target_relevant = action.target_column in ["rev_amt", "revenue_amount", "ssn", None]
+
             if keyword_hits >= 2 and target_relevant:
                 self.diagnosis_correct = True
                 self.pipeline_stage_health["stage_3_join"] = 0.5
                 reward += 0.25
             elif keyword_hits >= 1:
                 reward += min(0.05 * keyword_hits, 0.15)
+
+            target = (action.target_column or "").lower()
+            if target in ["metrics", "row_count", "revenue"] and "metrics" not in self.signals_unlocked:
+                metrics = build_metrics_facet(self.df)
+                if self.zombie_partition_active:
+                    metrics = MetricsFacet(
+                        row_count=metrics.row_count,
+                        historical_avg=metrics.historical_avg,
+                        null_ratio=metrics.null_ratio,
+                        storage_bytes=0,
+                    )
+                self.visible_signals.metrics = metrics
+                self.signals_unlocked.add("metrics")
+                reward += 0.05
+
+            if target in ["logs", "stage_3", "join"] and "logs" not in self.signals_unlocked:
+                self.visible_signals.logs = build_logs_facet(
+                    [
+                        "JoinError: column rev_amt not found in right table",
+                        "TypeError: cannot convert str to float64",
+                        "Warning: SSN column propagated to output",
+                    ],
+                    status="failed",
+                )
+                self.signals_unlocked.add("logs")
+                reward += 0.05
+
+            if target in ["pii", "ssn", "compliance"] and "compliance" not in self.signals_unlocked:
+                self.visible_signals.compliance = ComplianceFacet(
+                    pii_detected=not self.pii_masked,
+                    risky_columns=["ssn"] if not self.pii_masked else [],
+                )
+                self.signals_unlocked.add("compliance")
+                reward += 0.03
 
         elif action.action_type == ActionType.RENAME_COLUMN:
             if action.target_column == "rev_amt":
@@ -128,10 +202,34 @@ class Task3IncidentEnv:
         else:
             reward -= 0.10
 
+        if len(self.signals_unlocked) >= 2 and action.action_type in [
+            ActionType.CAST_TYPE,
+            ActionType.MASK_PII,
+            ActionType.VALIDATE,
+        ]:
+            process_bonus = 0.05 * (len(self.signals_unlocked) / 4)
+            reward += process_bonus
+
         self.downstream_health = sum(self.pipeline_stage_health.values()) / 5
         reward = max(-0.5, min(1.0, reward))
         self.step_count += 1
         done = done or (self.step_count >= self.MAX_STEPS)
+
+        aer = AERRecord(
+            step_id=self.step_count,
+            action_type=action.action_type.value,
+            target=action.target_column,
+            justification=action.justification,
+            reward_earned=round(reward, 4),
+            issues_identified=[bug["bug_id"] for bug in self.ground_truth],
+            issues_fixed=[
+                bug["bug_id"]
+                for bug in self.ground_truth
+                if (bug["type"] == "type_corruption" and self.fix_applied)
+                or (bug["type"] == "pii_leak" and self.pii_masked)
+            ],
+        )
+        self.aer_history.append(aer)
 
         return StepResult(
             observation=self._build_observation(),
@@ -142,6 +240,9 @@ class Task3IncidentEnv:
                 "fix_applied": self.fix_applied,
                 "pii_masked": self.pii_masked,
                 "validation_passed": self.validation_passed,
+                "signals_unlocked": list(self.signals_unlocked),
+                "visible_signals": self.visible_signals.model_dump() if self.visible_signals else {},
+                "aer_last": aer.model_dump(),
             },
         )
 

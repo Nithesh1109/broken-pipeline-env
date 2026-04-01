@@ -5,9 +5,19 @@ from pathlib import Path
 
 import pandas as pd
 
-from env.data.bug_injector import inject_bugs, load_scenario
+from env.data.bug_injector import get_failure_signature, inject_bugs, load_scenario
 from env.data.generator import generate_employee_dataset
-from env.models import ActionType, DataAction, DataObservation, DetectedIssue, StepResult
+from env.models import (
+    AERRecord,
+    ActionType,
+    AlertSignal,
+    DagOverview,
+    DataAction,
+    DataObservation,
+    DetectedIssue,
+    StepResult,
+    VisibleSignals,
+)
 
 
 class Task2SchemaEnv:
@@ -29,6 +39,9 @@ class Task2SchemaEnv:
         self.fixed_bug_ids: set[str] = set()
         self.downstream_health: float = 0.0
         self.blast_events: int = 0
+        self.visible_signals: VisibleSignals | None = None
+        self.signals_unlocked: set[str] = set()
+        self.aer_history: list[AERRecord] = []
 
     def reset(self) -> DataObservation:
         """Reset state and initialize a fresh corrupted Task2 dataframe."""
@@ -39,6 +52,24 @@ class Task2SchemaEnv:
         self.fixed_bug_ids = set()
         self.downstream_health = 0.0
         self.blast_events: int = 0
+
+        failure_sig = get_failure_signature(self.ground_truth)
+        initial_alert = AlertSignal(
+            severity="high",
+            message=f"Schema drift detected: {failure_sig.detection_hint}",
+            risk_score=0.78,
+        )
+        self.visible_signals = VisibleSignals(
+            alert=initial_alert,
+            dag=DagOverview(
+                current_node="stage_2_schema_validation",
+                upstream_nodes=["stage_1_ingest"],
+                downstream_nodes=["stage_3_join", "stage_4_aggregate"],
+            ),
+        )
+        self.signals_unlocked = {"dag"}
+        self.aer_history = []
+
         return self._build_observation()
 
     def _rows_passing(self) -> int:

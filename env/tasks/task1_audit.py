@@ -4,9 +4,27 @@ from pathlib import Path
 
 import pandas as pd
 
-from env.data.bug_injector import inject_bugs, load_scenario, matches_ground_truth
+from env.data.bug_injector import (
+    build_logs_facet,
+    build_metrics_facet,
+    get_failure_signature,
+    inject_bugs,
+    load_scenario,
+    matches_ground_truth,
+)
 from env.data.generator import generate_employee_dataset
-from env.models import ActionType, DataAction, DataObservation, DetectedIssue, StepResult
+from env.models import (
+    AERRecord,
+    ActionType,
+    AlertSignal,
+    ComplianceFacet,
+    DagOverview,
+    DataAction,
+    DataObservation,
+    DetectedIssue,
+    StepResult,
+    VisibleSignals,
+)
 
 
 class Task1AuditEnv:
@@ -24,6 +42,10 @@ class Task1AuditEnv:
         self.identified_bug_ids: set[str] = set()
         self.fixed_bug_ids: set[str] = set()
         self.downstream_health: float = 0.0
+        self.visible_signals: VisibleSignals | None = None
+        self.signals_unlocked: set[str] = set()
+        self.aer_history: list[AERRecord] = []
+        self.step_errors: list[str] = []
 
     def reset(self) -> DataObservation:
         """Reset state, generate deterministic data, inject bugs, and return observation."""
@@ -34,6 +56,18 @@ class Task1AuditEnv:
         self.identified_bug_ids = set()
         self.fixed_bug_ids = set()
         self.downstream_health = 0.0
+
+        failure_sig = get_failure_signature(self.ground_truth)
+        initial_alert = AlertSignal(
+            severity="high",
+            message=f"Pipeline anomaly: {failure_sig.detection_hint}",
+            risk_score=0.65,
+        )
+        self.visible_signals = VisibleSignals(alert=initial_alert)
+        self.signals_unlocked = set()
+        self.aer_history = []
+        self.step_errors = []
+
         return self._build_observation()
 
     def step(self, action: DataAction) -> StepResult:
@@ -42,6 +76,33 @@ class Task1AuditEnv:
         done = False
 
         if action.action_type == ActionType.INSPECT:
+            target = (action.target_column or "").lower()
+
+            if target == "metrics" and "metrics" not in self.signals_unlocked:
+                self.visible_signals.metrics = build_metrics_facet(self.df)
+                self.signals_unlocked.add("metrics")
+                reward += 0.05
+            elif target == "logs" and "logs" not in self.signals_unlocked:
+                self.visible_signals.logs = build_logs_facet(self.step_errors or ["No errors logged"])
+                self.signals_unlocked.add("logs")
+                reward += 0.05
+            elif target == "dag" and "dag" not in self.signals_unlocked:
+                self.visible_signals.dag = DagOverview(
+                    current_node="stage_1_audit",
+                    upstream_nodes=["ingestion"],
+                    downstream_nodes=["reporting"],
+                )
+                self.signals_unlocked.add("dag")
+                reward += 0.03
+            elif target in ["pii", "ssn", "compliance"] and "compliance" not in self.signals_unlocked:
+                pii_cols = [col for col in self.df.columns if "ssn" in col.lower()]
+                self.visible_signals.compliance = ComplianceFacet(
+                    pii_detected=len(pii_cols) > 0,
+                    risky_columns=pii_cols,
+                )
+                self.signals_unlocked.add("compliance")
+                reward += 0.05
+
             for issue in (action.identified_issues or []):
                 for truth in self.ground_truth:
                     if matches_ground_truth(issue, truth) and truth["bug_id"] not in self.identified_bug_ids:
@@ -124,6 +185,17 @@ class Task1AuditEnv:
         self.downstream_health = len(self.fixed_bug_ids) / self.TOTAL_BUGS
         done = done or (self.step_count >= self.MAX_STEPS)
 
+        aer = AERRecord(
+            step_id=self.step_count,
+            action_type=action.action_type.value,
+            target=action.target_column,
+            justification=action.justification,
+            reward_earned=round(reward, 4),
+            issues_identified=list(self.identified_bug_ids),
+            issues_fixed=list(self.fixed_bug_ids),
+        )
+        self.aer_history.append(aer)
+
         return StepResult(
             observation=self._build_observation(),
             reward=round(reward, 4),
@@ -131,6 +203,10 @@ class Task1AuditEnv:
             info={
                 "fixed": list(self.fixed_bug_ids),
                 "identified": list(self.identified_bug_ids),
+                "signals_unlocked": list(self.signals_unlocked),
+                "visible_signals": self.visible_signals.model_dump() if self.visible_signals else {},
+                "aer_last": aer.model_dump(),
+                "step": self.step_count,
             },
         )
 
