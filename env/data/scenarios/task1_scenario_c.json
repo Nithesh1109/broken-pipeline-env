@@ -2,17 +2,17 @@
   {
     "bug_id": "B001",
     "type": "null_injection",
-    "column": "name",
+    "column": "salary",
     "rows": [8, 33, 91],
     "severity": "high",
-    "description": "NULL values injected in name column"
+    "description": "NULL values injected in salary column"
   },
   {
     "bug_id": "B002",
     "type": "type_corruption",
     "column": "age",
     "row": 22,
-    "value": "forty-five",
+    "value": "twenty-eight",
     "severity": "high",
     "description": "Age stored as string instead of integer at row 22"
   },
@@ -21,9 +21,9 @@
     "type": "out_of_range",
     "column": "age",
     "row": 50,
-    "value": -3,
+    "value": 150,
     "severity": "medium",
-    "description": "Age value -3 is negative, outside valid range 22-65"
+    "description": "Age value 150 is outside valid range 22-65"
   },
   {
     "bug_id": "B004",

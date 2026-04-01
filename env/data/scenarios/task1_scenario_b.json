@@ -2,28 +2,28 @@
   {
     "bug_id": "B001",
     "type": "null_injection",
-    "column": "department",
+    "column": "salary",
     "rows": [12, 55, 78],
     "severity": "high",
-    "description": "NULL values injected in department column"
+    "description": "NULL values injected in salary column"
   },
   {
     "bug_id": "B002",
     "type": "type_corruption",
-    "column": "salary",
+    "column": "age",
     "row": 18,
-    "value": "seventy-thousand",
+    "value": "forty-two",
     "severity": "high",
-    "description": "Salary stored as string instead of numeric at row 18"
+    "description": "Age stored as string instead of integer at row 18"
   },
   {
     "bug_id": "B003",
     "type": "out_of_range",
-    "column": "salary",
+    "column": "age",
     "row": 42,
-    "value": -5000,
+    "value": -5,
     "severity": "medium",
-    "description": "Salary value -5000 is negative, outside valid range"
+    "description": "Age value -5 is negative, outside valid range"
   },
   {
     "bug_id": "B004",
