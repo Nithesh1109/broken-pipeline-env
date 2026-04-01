@@ -170,7 +170,6 @@ def demo() -> dict[str, Any]:
             "action": action.model_dump(),
             "reward": result.reward,
             "done": result.done,
-            "error_msg": result.error_msg,
             "next_obs": result.observation.model_dump()
         })
         if result.done:
