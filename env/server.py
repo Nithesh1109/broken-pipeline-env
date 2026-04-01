@@ -127,7 +127,7 @@ def list_tasks() -> dict[str, Any]:
         "tasks": [
             {"id": 1, "name": "Data Quality Audit", "difficulty": "easy", "max_steps": 8},
             {"id": 2, "name": "Schema Drift Remediation", "difficulty": "medium", "max_steps": 8},
-            {"id": 3, "name": "Full Data Incident Response", "difficulty": "hard", "max_steps": 8},
+            {"id": 3, "name": "Full Data Incident Response", "difficulty": "hard", "max_steps": 20},
         ],
         "action_schema": DataAction.model_json_schema(),
     }
@@ -138,6 +138,49 @@ def reset(task_id: int = 1) -> DataObservation:
     env = _get_env(task_id)
     obs = env.reset()
     return obs
+
+
+@app.get("/demo")
+def demo() -> dict[str, Any]:
+    """Run a hardcoded smart agent on Task 1 for demonstration purposes."""
+    import random
+    env = _get_env(1)
+    
+    # Force the base scenario so the hardcoded actions match the bugs
+    original_choice = random.choice
+    random.choice = lambda seq: [f for f in seq if f.name == "task1_scenario.json"][0]
+    try:
+        obs = env.reset()
+    finally:
+        random.choice = original_choice
+
+    trace = [obs.model_dump()]
+    
+    actions = [
+        DataAction(action_type=ActionType.INSPECT, target_column="salary", justification="Check salary for issues"),
+        DataAction(action_type=ActionType.INSPECT, target_column="age", justification="Check age for issues"),
+        DataAction(action_type=ActionType.FILL_DEFAULT, target_column="salary", transformation="fill_median", justification="Fix nulls in salary"),
+        DataAction(action_type=ActionType.CAST_TYPE, target_column="age", transformation="cast_to_int", justification="Fix string type in age"),
+        DataAction(action_type=ActionType.VALIDATE, justification="Verify fixes")
+    ]
+    
+    for action in actions:
+        result = env.step(action)
+        trace.append({
+            "action": action.model_dump(),
+            "reward": result.reward,
+            "done": result.done,
+            "error_msg": result.error_msg,
+            "next_obs": result.observation.model_dump()
+        })
+        if result.done:
+            break
+            
+    score = grade_task1(env).score
+    return {
+        "score": score,
+        "trace": trace
+    }
 
 
 @app.post("/step", response_model=StepResult)
