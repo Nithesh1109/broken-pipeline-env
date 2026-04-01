@@ -1,0 +1,44 @@
+[
+  {
+    "bug_id": "B001",
+    "type": "null_injection",
+    "column": "department",
+    "rows": [12, 55, 78],
+    "severity": "high",
+    "description": "NULL values injected in department column"
+  },
+  {
+    "bug_id": "B002",
+    "type": "type_corruption",
+    "column": "salary",
+    "row": 18,
+    "value": "seventy-thousand",
+    "severity": "high",
+    "description": "Salary stored as string instead of numeric at row 18"
+  },
+  {
+    "bug_id": "B003",
+    "type": "out_of_range",
+    "column": "salary",
+    "row": 42,
+    "value": -5000,
+    "severity": "medium",
+    "description": "Salary value -5000 is negative, outside valid range"
+  },
+  {
+    "bug_id": "B004",
+    "type": "format_inconsistency",
+    "column": "phone",
+    "row": 30,
+    "severity": "low",
+    "description": "Phone reformatted to +1-555-XXXXXXX instead of 555XXXXXXX"
+  },
+  {
+    "bug_id": "B005",
+    "type": "duplicate_rows",
+    "column": null,
+    "indices": [60, 61],
+    "severity": "medium",
+    "description": "Rows 60 and 61 duplicated"
+  }
+]
