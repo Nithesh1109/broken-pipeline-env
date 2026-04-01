@@ -105,7 +105,7 @@ nulled out `consent_flag`. Fix the schema before downstream joins fail.
 Wrong column drops trigger cascade penalties.
 **Grader:** `0.60 × rows_passing + 0.25 × column_recovery + 0.15 × type_correctness − blast_penalty`
 
-### Task 3 — Full Incident Response (Hard, max_steps=8)
+### Task 3 — Full Incident Response (Hard, max_steps=20)
 Production revenue numbers are wrong. Trace back through 5 pipeline stages:
 stage_5 → stage_4 → stage_3 to find the corruption entry point. Fix `rev_amt`
 type, mask SSN PII, validate output.

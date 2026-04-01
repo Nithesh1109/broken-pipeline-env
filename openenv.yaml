@@ -17,7 +17,7 @@ tasks:
   - id: 3
     name: "Full Data Incident Response"
     difficulty: "hard"
-    max_steps: 8
+    max_steps: 20
 
 action_space:
   type: "structured_json"
