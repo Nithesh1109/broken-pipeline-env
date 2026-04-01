@@ -14,6 +14,8 @@ Features:
 - Strict env var validation on startup
 """
 from __future__ import annotations
+from dotenv import load_dotenv
+load_dotenv()
 
 import json
 import os
