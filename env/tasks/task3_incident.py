@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 import pandas as pd
@@ -29,8 +30,8 @@ from env.models import (
 class Task3IncidentEnv:
     """Task 3 environment for full data incident response handling."""
 
-    MAX_STEPS = 8
-    SCENARIO_PATH = Path(__file__).parent.parent / "data" / "scenarios" / "task3_scenario.json"
+    MAX_STEPS = 20
+    SCENARIO_DIR = Path(__file__).parent.parent / "data" / "scenarios"
     CORRECT_DIAGNOSIS_KEYWORDS = [
         "stage 3",
         "join stage",
@@ -91,7 +92,7 @@ class Task3IncidentEnv:
         self.validation_passed: bool = False
 
         self.pipeline_stage_health: dict[str, float] = {}
-        self.downstream_health: float = 0.0
+        self.downstream_health: float = 1.0
         self.zombie_partition_active: bool = False
         self.silent_drop_active: bool = False
         self.visible_signals: VisibleSignals | None = None
@@ -104,7 +105,9 @@ class Task3IncidentEnv:
         """Reset state, build deterministic dataset, inject bugs, and return observation."""
         clean_df = generate_employee_dataset(seed=42)
         clean_df["revenue_amount"] = (clean_df["salary"].astype(float) * 1.35).round(2)
-        scenario_bugs = load_scenario(str(self.SCENARIO_PATH))
+        scenario_files = sorted(self.SCENARIO_DIR.glob("task3_scenario*.json"))
+        chosen = random.choice(scenario_files)
+        scenario_bugs = load_scenario(str(chosen))
         self.df, self.ground_truth = inject_bugs(clean_df, scenario_bugs)
 
         self.step_count = 0

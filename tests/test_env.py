@@ -1,7 +1,22 @@
+import pytest
+import random
+
 from env.data.generator import generate_employee_dataset
 from env.graders import grade_task1, grade_task3
 from env.models import ActionType, DataAction, DataObservation
 from env.tasks import Task1AuditEnv, Task2SchemaEnv, Task3IncidentEnv
+
+
+@pytest.fixture(autouse=True)
+def force_base_scenarios(monkeypatch):
+	original_choice = random.choice
+	def custom_choice(seq):
+		if seq and hasattr(seq[0], "name") and "scenario" in seq[0].name:
+			base = [f for f in seq if f.name in ["task1_scenario.json", "task2_scenario.json", "task3_scenario.json"]]
+			if base:
+				return base[0]
+		return original_choice(seq)
+	monkeypatch.setattr(random, "choice", custom_choice)
 
 
 def test_reset_returns_valid_observation():

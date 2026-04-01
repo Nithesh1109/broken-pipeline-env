@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 import pandas as pd
@@ -32,7 +33,7 @@ class Task1AuditEnv:
 
     MAX_STEPS = 8
     TOTAL_BUGS = 5
-    SCENARIO_PATH = Path(__file__).parent.parent / "data" / "scenarios" / "task1_scenario.json"
+    SCENARIO_DIR = Path(__file__).parent.parent / "data" / "scenarios"
 
     def __init__(self) -> None:
         """Initialize Task1 mutable state containers."""
@@ -42,7 +43,7 @@ class Task1AuditEnv:
         self.identified_bug_ids: set[str] = set()
         self.fixed_bug_ids: set[str] = set()
         self.discovered_bugs: set[str] = set()          # NEW: progressive discovery
-        self.downstream_health: float = 0.0
+        self.downstream_health: float = 1.0
         self.visible_signals: VisibleSignals | None = None
         self.signals_unlocked: set[str] = set()
         self.aer_history: list[AERRecord] = []
@@ -50,14 +51,16 @@ class Task1AuditEnv:
 
     def reset(self) -> DataObservation:
         """Reset state, generate deterministic data, inject bugs, and return observation."""
-        scenario = load_scenario(str(self.SCENARIO_PATH))
+        scenario_files = sorted(self.SCENARIO_DIR.glob("task1_scenario*.json"))
+        chosen = random.choice(scenario_files)
+        scenario = load_scenario(str(chosen))
         clean_df = generate_employee_dataset(seed=42)
         self.df, self.ground_truth = inject_bugs(clean_df, scenario)
         self.step_count = 0
         self.identified_bug_ids = set()
         self.fixed_bug_ids = set()
         self.discovered_bugs = set()                     # NEW: starts empty
-        self.downstream_health = 0.0
+        self.downstream_health = 1.0
 
         failure_sig = get_failure_signature(self.ground_truth)
         initial_alert = AlertSignal(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 import pandas as pd
@@ -32,11 +33,12 @@ class Task2SchemaEnv:
 
     MAX_STEPS = 8
     TOTAL_BUGS = 3
-    SCENARIO_PATH = Path(__file__).parent.parent / "data" / "scenarios" / "task2_scenario.json"
+    SCENARIO_DIR = Path(__file__).parent.parent / "data" / "scenarios"
 
     def __init__(self) -> None:
         """Initialize dependency graph and task state containers."""
-        with self.SCENARIO_PATH.open("r", encoding="utf-8") as handle:
+        default_scenario = self.SCENARIO_DIR / "task2_scenario.json"
+        with default_scenario.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
         self.COLUMN_DEPENDENCIES: dict[str, list[str]] = payload.get("column_dependencies", {})
 
@@ -46,22 +48,30 @@ class Task2SchemaEnv:
         self.identified_bug_ids: set[str] = set()
         self.fixed_bug_ids: set[str] = set()
         self.discovered_bugs: set[str] = set()          # NEW: progressive discovery
-        self.downstream_health: float = 0.0
+        self.downstream_health: float = 1.0
         self.blast_events: int = 0
         self.visible_signals: VisibleSignals | None = None
         self.signals_unlocked: set[str] = set()
         self.aer_history: list[AERRecord] = []
+        self.current_scenario_path: Path | None = None
 
     def reset(self) -> DataObservation:
         """Reset state and initialize a fresh corrupted Task2 dataframe."""
-        scenario_bugs = load_scenario(str(self.SCENARIO_PATH))
+        scenario_files = sorted(self.SCENARIO_DIR.glob("task2_scenario*.json"))
+        chosen = random.choice(scenario_files)
+        self.current_scenario_path = chosen
+        # Reload dependencies from chosen scenario
+        with chosen.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.COLUMN_DEPENDENCIES = payload.get("column_dependencies", self.COLUMN_DEPENDENCIES)
+        scenario_bugs = load_scenario(str(chosen))
         clean_df = generate_employee_dataset(seed=42)
         self.df, self.ground_truth = inject_bugs(clean_df, scenario_bugs)
         self.step_count = 0
         self.identified_bug_ids = set()
         self.fixed_bug_ids = set()
         self.discovered_bugs = set()                     # NEW: starts empty
-        self.downstream_health = 0.0
+        self.downstream_health = 1.0
         self.blast_events: int = 0
 
         failure_sig = get_failure_signature(self.ground_truth)
@@ -113,7 +123,7 @@ class Task2SchemaEnv:
         reward = 0.0
         done = False
 
-        scenario_bugs = load_scenario(str(self.SCENARIO_PATH))
+        scenario_bugs = load_scenario(str(self.current_scenario_path))
         expected_renames = {
             b["new_col"]: b["old_col"]
             for b in scenario_bugs
