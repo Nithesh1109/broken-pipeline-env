@@ -34,14 +34,18 @@ load_dotenv()
 
 
 def get_runtime_config() -> dict[str, str]:
-    """Load and validate runtime configuration lazily (import-safe)."""
     api_base_url = os.getenv("API_BASE_URL", "http://localhost:7860")
 
-    # Spec requires OPENAI_API_KEY — also support HF_TOKEN as fallback
+    # Judges inject API_KEY and API_BASE_URL — this is the primary path
+    api_key = os.getenv("API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
     hf_token = os.getenv("HF_TOKEN")
 
-    if openai_key:
+    if api_key:
+        token = api_key
+        llm_base_url = os.getenv("LLM_BASE_URL", api_base_url)
+        model_name = os.getenv("MODEL_NAME", "gpt-4o-mini")
+    elif openai_key:
         token = openai_key
         llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
         model_name = os.getenv("MODEL_NAME", "gpt-4o-mini")
@@ -51,11 +55,11 @@ def get_runtime_config() -> dict[str, str]:
         model_name = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
     else:
         raise EnvironmentError(
-            "Set OPENAI_API_KEY (required by OpenEnv spec) or HF_TOKEN as fallback."
+            "Set API_KEY, OPENAI_API_KEY, or HF_TOKEN."
         )
 
     return {
-        "api_base_url": api_base_url,
+        "api_base_url": os.getenv("API_BASE_URL", "http://localhost:7860"),
         "model_name": model_name,
         "token": token,
         "llm_base_url": llm_base_url,
@@ -635,7 +639,7 @@ def main() -> None:
     # FIX C: Guard get_runtime_config() so a missing env var never
     # prevents [START]/[END] from appearing in stdout.
     try:
-        config = get_runtime_config()
+        cfg = get_runtime_config()
     except EnvironmentError as e:
         print(f"[CONFIG ERROR] {e}", flush=True)
         for task_id in tasks_to_run:
@@ -645,8 +649,8 @@ def main() -> None:
         sys.exit(1)
 
     client = OpenAI(
-        api_key=config["token"],
-        base_url=config["llm_base_url"],
+        api_key=cfg["token"],
+        base_url=cfg["llm_base_url"],
     )
 
     scores: dict[int, float] = {}
@@ -656,7 +660,7 @@ def main() -> None:
         print(f"  TASK {task_id}", flush=True)
         print(f"{'=' * 65}", flush=True)
         try:
-            scores[task_id] = run_episode(task_id, config, client, seed=args.seed)
+            scores[task_id] = run_episode(task_id, cfg, client, seed=args.seed)
         except Exception as exc:
             print(f"  [TASK {task_id} FAILED] {exc}", flush=True)
             scores[task_id] = 0.0
@@ -679,13 +683,13 @@ def main() -> None:
 
     try:
         http.post(
-            f"{config['api_base_url']}/record_score",
+            f"{cfg['api_base_url']}/record_score",
             json={
                 "task_1": scores.get(1, 0.0),
                 "task_2": scores.get(2, 0.0),
                 "task_3": scores.get(3, 0.0),
                 "average": avg,
-                "model": config["model_name"],
+                "model": cfg["model_name"],
             },
             timeout=10,
         )
