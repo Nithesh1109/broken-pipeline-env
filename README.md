@@ -1,8 +1,17 @@
-# DataOpsEnv — Production Grade Update (Phase 1-9)
+﻿---
+title: Openenv Submission
+emoji: 🔧
+colorFrom: red
+colorTo: yellow
+sdk: docker
+pinned: false
+---
+
+# DataOpsEnv â€” Production Grade Update (Phase 1-9)
 
 DataOpsEnv has been upgraded to a robust, dynamic, robust 10/10 AI Data Engineer training environment. All hardcodes have been removed in favor of procedural generation, strict state gating, and precise multi-action evaluations.
 
-## 🚀 Key Improvements
+## ðŸš€ Key Improvements
 
 1. **State Isolation & Deployment Safe**: Server now warns of module-level caching and persists scores safely via multithreaded-locked `leaderboard.json` rather than memory. Added `/.well-known/env-info` for transparency.
 2. **Procedural Generation**: `env/data/scenario_generator.py` replaces hardcoded traces. Tasks dynamically generate distinct permutations of column names, error types, duplicate distributions, and PII leaks, enabling robust LLM training logic free from memorization.
@@ -13,12 +22,12 @@ DataOpsEnv has been upgraded to a robust, dynamic, robust 10/10 AI Data Engineer
 4. **Dynamic Inference Bounds**: Removed fixed 8-step `MAX_STEPS`. `DataObservation` exposes task boundaries so Agents know their precise budget constraint per environment dynamically.
 5. **Diversity & Benchmark Validated**: Automated tests validating >90% procedural uniqueness alongside rigorous bounded thresholds for deterministic validation NOOP agents.
 
-## 📂 Documentation
+## ðŸ“‚ Documentation
 
 * `docs/architecture.md`: Overview of request pathways and pipeline state.
 * `docs/reward_design.md`: Explains reasoning sub-scores, scaling gates, and exact metric criteria for Judges.
 
-## 🛠 Usage
+## ðŸ›  Usage
 
 **Run Unit Tests:**
 ```bash
@@ -34,3 +43,4 @@ python scripts/validate_diversity.py
 ```bash
 python scripts/benchmark.py
 ```
+
