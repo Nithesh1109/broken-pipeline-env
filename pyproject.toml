@@ -27,3 +27,11 @@ server = "server.app:main"
 [tool.openenv]
 name = "broken-pipeline-env"
 version = "1.0.0"
+
+[tool.pytest.ini_options]
+pythonpath = [
+    ".",
+]
+testpaths = [
+    "tests",
+]

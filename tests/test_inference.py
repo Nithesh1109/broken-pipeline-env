@@ -26,15 +26,24 @@ from env.tasks.task3_incident import Task3IncidentEnv
 class TestGrader1:
     def test_zero_score_at_reset(self):
         env = Task1AuditEnv()
-        env.reset()
+        env.reset(scenario_override="task1_scenario.json")
         result = grade_task1(env)
-        assert result.score == 0.0
+        assert result.score == 0.0001
         assert 0.0 <= result.score <= 1.0
 
     def test_score_increases_after_fix(self):
         env = Task1AuditEnv()
-        env.reset()
+        env.reset(scenario_override="task1_scenario.json")
+        
+        env.step(
+            DataAction(
+                action_type=ActionType.INSPECT,
+                target_column="salary",
+                justification="Checking salary first",
+            )
+        )
         before = grade_task1(env).score
+        
         env.step(
             DataAction(
                 action_type=ActionType.FILL_DEFAULT,
@@ -48,16 +57,16 @@ class TestGrader1:
 
     def test_perfect_score_formula(self):
         env = Task1AuditEnv()
-        env.reset()
+        env.reset(scenario_override="task1_scenario.json")
         for bug in env.ground_truth:
             env.identified_bug_ids.add(bug["bug_id"])
             env.fixed_bug_ids.add(bug["bug_id"])
         result = grade_task1(env)
-        assert result.score == 1.0
+        assert result.score == 0.9999
 
     def test_identification_only_score(self):
         env = Task1AuditEnv()
-        env.reset()
+        env.reset(scenario_override="task1_scenario.json")
         for bug in env.ground_truth:
             env.identified_bug_ids.add(bug["bug_id"])
         result = grade_task1(env)
@@ -65,7 +74,7 @@ class TestGrader1:
 
     def test_breakdown_keys_present(self):
         env = Task1AuditEnv()
-        env.reset()
+        env.reset(scenario_override="task1_scenario.json")
         result = grade_task1(env)
         assert "identification" in result.breakdown
         assert "remediation" in result.breakdown
@@ -73,15 +82,15 @@ class TestGrader1:
 
     def test_deterministic(self):
         env = Task1AuditEnv()
-        env.reset()
+        env.reset(scenario_override="task1_scenario.json")
         s1 = grade_task1(env).score
         s2 = grade_task1(env).score
         assert s1 == s2
 
     def test_noop_baseline_below_threshold(self):
         env = Task1AuditEnv()
-        env.reset()
-        for _ in range(8):
+        env.reset(scenario_override="task1_scenario.json")
+        for _ in range(10):  # MAX_STEPS = 10
             env.step(DataAction(action_type=ActionType.NOOP, justification="noop"))
         assert grade_task1(env).score < 0.1
 
@@ -106,7 +115,7 @@ class TestGrader2:
         env = Task2SchemaEnv()
         env.reset()
         result = grade_task2(env)
-        assert "schema_compliance" in result.breakdown
+        assert "fix_score" in result.breakdown
         assert "blast_radius_penalty" in result.breakdown
         assert "bugs_fixed" in result.breakdown
 
@@ -136,7 +145,7 @@ class TestGrader3:
         env = Task3IncidentEnv()
         env.reset()
         env.diagnosis_correct = True
-        env.fixes_applied = env.REQUIRED_FIXES
+        env.fix_applied = True
         env.pii_masked = True
         env.validation_passed = True
         result = grade_task3(env)
@@ -504,7 +513,7 @@ class TestGrader3Bonuses:
         env = Task3IncidentEnv()
         env.reset()
         env.diagnosis_correct = True
-        env.fixes_applied = env.REQUIRED_FIXES
+        env.fix_applied = True
         env.pii_masked = True
         env.validation_passed = True
         env.step_count = 3

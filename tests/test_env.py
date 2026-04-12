@@ -21,19 +21,19 @@ def force_base_scenarios(monkeypatch):
 
 def test_reset_returns_valid_observation():
 	env = Task1AuditEnv()
-	obs = env.reset()
+	obs = env.reset(scenario_override="task1_scenario.json")
 	assert isinstance(obs, DataObservation)
 	assert len(obs.dataset_preview) > 0
 	assert 0.0 <= obs.downstream_health <= 1.0
-	assert obs.time_remaining == 8
+	assert obs.time_remaining == 10  # MAX_STEPS = 10
 	assert obs.task_id == 1
 
 
 def test_step_loop_terminates_at_max_steps():
 	env = Task1AuditEnv()
-	env.reset()
+	env.reset(scenario_override="task1_scenario.json")
 	done = False
-	for _ in range(10):
+	for _ in range(10):  # MAX_STEPS = 10
 		result = env.step(DataAction(action_type=ActionType.NOOP, justification="test"))
 		if result.done:
 			done = True
@@ -43,7 +43,7 @@ def test_step_loop_terminates_at_max_steps():
 
 def test_grader_is_deterministic():
 	env = Task1AuditEnv()
-	env.reset()
+	env.reset(scenario_override="task1_scenario.json")
 	s1 = grade_task1(env).score
 	s2 = grade_task1(env).score
 	assert s1 == s2
@@ -51,15 +51,15 @@ def test_grader_is_deterministic():
 
 def test_noop_baseline_scores_below_threshold():
 	env = Task1AuditEnv()
-	env.reset()
-	for _ in range(8):
+	env.reset(scenario_override="task1_scenario.json")
+	for _ in range(10):  # MAX_STEPS = 10
 		env.step(DataAction(action_type=ActionType.NOOP, justification="noop"))
 	assert grade_task1(env).score < 0.1
 
 
 def test_correct_fix_increases_score():
 	env = Task1AuditEnv()
-	env.reset()
+	env.reset(scenario_override="task1_scenario.json")
 	score_before = grade_task1(env).score
 	env.step(
 		DataAction(
@@ -117,7 +117,7 @@ def test_server_reset_and_step():
 
 def test_task3_pii_penalty():
 	env = Task3IncidentEnv()
-	env.reset()
+	env.reset(scenario_override="task3_scenario.json")
 	for _ in range(8):
 		env.step(DataAction(action_type=ActionType.NOOP, justification="noop"))
 	result = grade_task3(env)
@@ -126,7 +126,7 @@ def test_task3_pii_penalty():
 
 def test_blast_radius_penalizes_score():
 	env = Task2SchemaEnv()
-	env.reset()
+	env.reset(scenario_override="task2_scenario.json")
 	health_before = env.downstream_health
 	env.step(
 		DataAction(

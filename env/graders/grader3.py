@@ -34,39 +34,61 @@ EXACT_STAGE_KEYWORDS = [
 ]
 
 
+def _action_is_substantive(action_type: str) -> bool:
+    """Return True if the action_type represents a real investigation or fix step."""
+    return action_type.upper() not in {"NOOP", ""}
+
+
 def _contextual_reasoning_bonus(env: Task3IncidentEnv) -> float:
     """
-    Award up to +0.05 for correct diagnostic language in justifications.
+    Award up to +0.05 for correct diagnostic language in justifications,
+    but ONLY when the agent has actually performed substantive actions
+    AND the keywords relate to signals the agent has already unlocked.
 
-    Rules (to prevent keyword gaming):
-    - Returns 0.0 unconditionally if ALL actions were NOOPs.
-    - Keywords must appear in justifications from non-NOOP steps.
-    - Keyword 'ssn' or 'pii' earns credit only if the agent has already
-      inspected stage_3 or a compliance facet (i.e., has seen PII signals).
-    - Max credit: 1 keyword × 0.05.
-
-    Judges can verify: keyword credit requires prior stage inspection,
-    not just mentioning the keyword in a NOOP.
+    Scoring rules:
+      - NOOP actions are excluded entirely (prevents keyword stuffing)
+      - Keywords only count if the agent has unlocked the corresponding signal:
+        * "ssn"/"pii" keywords require "compliance" signal unlocked
+        * "schema drift"/"rev_amt"/"type mismatch" require "schema" or "logs" unlocked
+        * "stage 3"/"join"/"aggregation"/"revenue" require any stage inspected
+      - Max bonus: 0.05 (1 qualifying keyword × 0.05, hard cap)
     """
     if not getattr(env, "aer_history", None):
         return 0.0
-    # Guard: no credit if every action was a NOOP
-    substantive = [r for r in env.aer_history if r.action_type != "NOOP"]
-    if not substantive:
+
+    signals = getattr(env, "signals_unlocked", set())
+    stages = getattr(env, "stages_inspected", set())
+
+    # Only consider justifications from substantive (non-NOOP) actions
+    substantive_justifications = " ".join(
+        r.justification.lower()
+        for r in env.aer_history
+        if _action_is_substantive(r.action_type)
+    )
+    if not substantive_justifications:
         return 0.0
-    # Build combined justification text from substantive actions only
-    combined = " ".join(r.justification.lower() for r in substantive)
-    stages_seen = getattr(env, "stages_inspected", set())
-    signals_seen = getattr(env, "signals_unlocked", set())
-    # Context-gated keyword matching
+
+    # Context-aware keyword groups: each requires a specific signal/stage
+    CONTEXTUAL_KEYWORDS: list[tuple[list[str], set[str], set[str]]] = [
+        # (keywords, required_signals, required_stages)
+        (["ssn", "pii"], {"compliance"}, set()),
+        (["schema drift", "rev_amt", "type mismatch", "type error"], {"schema", "logs"}, set()),
+        (["stage 3", "join stage", "join", "corruption"], set(), {"stage_3"}),
+        (["revenue", "aggregation"], set(), {"stage_4", "stage_5"}),
+    ]
+
     hits = 0
-    for kw in DIAGNOSIS_KEYWORDS:
-        if kw not in combined:
+    for keywords, req_signals, req_stages in CONTEXTUAL_KEYWORDS:
+        # Check if the agent has unlocked the required context
+        has_signal_context = not req_signals or bool(req_signals & signals)
+        has_stage_context = not req_stages or bool(req_stages & stages)
+        if not (has_signal_context or has_stage_context):
             continue
-        # PII-domain keywords require prior pii/stage_3 inspection
-        if kw in ("ssn", "pii") and "stage_3" not in stages_seen and "compliance" not in signals_seen:
-            continue
-        hits += 1
+        for kw in keywords:
+            if kw in substantive_justifications:
+                hits += 1
+                break  # One hit per group is enough
+
     return round(min(0.05 * hits, 0.05), 4)
 
 
@@ -96,19 +118,20 @@ def _signals_investigation_bonus(env: Task3IncidentEnv) -> float:
 def _efficiency_bonus(env: Task3IncidentEnv) -> float:
     """Small bonus for completing all sub-tasks efficiently.
     
-    Uses env.MAX_STEPS (not hardcoded 8) so the bonus scales correctly
-    for Task 3's 20-step budget. Clamped to >= 0.0.
+    Uses env.MAX_STEPS (default 20) instead of hardcoded value.
+    Result is clamped to >= 0.0 to prevent negative bonus.
     """
     all_done = (
         env.diagnosis_correct
-        and bool(env.fixes_applied >= env.REQUIRED_FIXES)
+        and env.fix_applied
         and env.pii_masked
         and env.validation_passed
     )
     if not all_done:
         return 0.0
-    steps_used = max(0, int(getattr(env, "step_count", env.MAX_STEPS)))
     max_steps = max(1, int(getattr(env, "MAX_STEPS", 20)))
+    steps_used = int(getattr(env, "step_count", max_steps))
+    steps_used = max(0, steps_used)
     return round(max(0.0, 0.03 * (1.0 - (steps_used / max_steps))), 4)
 
 
@@ -123,10 +146,10 @@ def grade_task3(env: Task3IncidentEnv) -> GraderResult:
       validation × 0.20
 
         Bonuses (additive, capped by final clamp):
-            reasoning_bonus          up to +0.15
-            root_cause_attribution   up to +0.05
-            signals_investigation    up to +0.08
-            efficiency_bonus         up to +0.03
+            contextual_reasoning_bonus  up to +0.05 (anti-gaming: requires substantive actions + signal context)
+            root_cause_attribution      up to +0.05
+            signals_investigation       up to +0.08
+            efficiency_bonus            up to +0.03
 
         Penalties:
             pii_compliance_penalty = -0.20 if pii_masked is False
@@ -136,7 +159,7 @@ def grade_task3(env: Task3IncidentEnv) -> GraderResult:
     """
     sub = {
         "diagnosis": 1.0 if env.diagnosis_correct else 0.0,
-        "fix": 1.0 if bool(env.fixes_applied >= env.REQUIRED_FIXES) else 0.0,
+        "fix": 1.0 if env.fix_applied else 0.0,
         "pii_sweep": 1.0 if env.pii_masked else 0.0,
         "validation": 1.0 if env.validation_passed else 0.0,
     }
@@ -148,7 +171,7 @@ def grade_task3(env: Task3IncidentEnv) -> GraderResult:
     efficiency_bon = _efficiency_bonus(env)
 
     total_bonus = reasoning_bon + root_cause_bon + signals_bon + efficiency_bon
-    score = round(max(0.0, min(1.0, weighted + pii_penalty + total_bonus)), 4)
+    score = round(max(0.0001, min(0.9999, weighted + pii_penalty + total_bonus)), 4)
 
     return GraderResult(
         score=score,

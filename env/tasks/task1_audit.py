@@ -8,13 +8,13 @@ import pandas as pd
 from env.data.bug_injector import (
     build_logs_facet,
     build_metrics_facet,
+    generate_scenario,
     get_failure_signature,
     inject_bugs,
     load_scenario,
     matches_ground_truth,
 )
 from env.data.generator import generate_employee_dataset
-from env.data.scenario_generator import generate_scenario
 from env.models import (
     AERRecord,
     ActionType,
@@ -32,7 +32,7 @@ from env.models import (
 class Task1AuditEnv:
     """Task 1 environment for data quality audit and direct remediation."""
 
-    MAX_STEPS = 8
+    MAX_STEPS = 10
     TOTAL_BUGS = 5
     SCENARIO_DIR = Path(__file__).parent.parent / "data" / "scenarios"
 
@@ -51,21 +51,15 @@ class Task1AuditEnv:
         self.step_errors: list[str] = []
         self.inspected_targets: set[str] = set()
 
-    def reset(self, scenario_override: str | None = None) -> DataObservation:
-        """Reset state with a fresh procedurally generated scenario.
-        
-        Args:
-            scenario_override: If provided, load this specific scenario JSON file.
-                               Used only by /demo for deterministic traces.
-        """
+    def reset(self, seed: int = 42, scenario_override: str | None = None) -> DataObservation:
+        """Reset state, generate deterministic data, inject bugs, and return observation."""
         if scenario_override:
-            scenario = load_scenario(scenario_override)
+            chosen = self.SCENARIO_DIR / scenario_override
+            scenario = load_scenario(str(chosen))
         else:
-            # Procedural generation: fresh seed each episode
-            import random as _random
-            ep_seed = _random.randint(0, 9999)
-            scenario = generate_scenario(ep_seed, task_id=1, difficulty="easy")
-        clean_df = generate_employee_dataset(seed=42)
+            # Procedural generation for live episodes
+            scenario = generate_scenario(seed=seed, task_id="task1", difficulty="easy")
+        clean_df = generate_employee_dataset(seed=seed)
         self.df, self.ground_truth = inject_bugs(clean_df, scenario)
         self.step_count = 0
         self.identified_bug_ids = set()
@@ -91,6 +85,7 @@ class Task1AuditEnv:
         """Apply an agent action and return the resulting transition tuple."""
         reward = 0.0
         done = False
+        prev_fixed_count = len(self.fixed_bug_ids)
 
         if action.action_type == ActionType.INSPECT:
             target = (action.target_column or "").lower()
@@ -107,7 +102,7 @@ class Task1AuditEnv:
 
             reinspecting = target in self.inspected_targets
             if reinspecting:
-                reward -= 0.10   # raised from -0.05 (Fix 4.2)
+                reward -= 0.10  # Raised re-inspect penalty
             else:
                 self.inspected_targets.add(target)
 
@@ -132,6 +127,8 @@ class Task1AuditEnv:
                 for bug in self.ground_truth:
                     if bug["type"] == "schema_drift" and bug["bug_id"] not in self.discovered_bugs:
                         self.discovered_bugs.add(bug["bug_id"])
+                        if bug["bug_id"] not in self.identified_bug_ids:
+                            self.identified_bug_ids.add(bug["bug_id"])
                         if not reinspecting: reward += 0.15
                 self.signals_unlocked.add("schema")
                 if not reinspecting: reward += 0.05
@@ -206,7 +203,9 @@ class Task1AuditEnv:
                 reward += 0.20
             if len(self.fixed_bug_ids) == self.TOTAL_BUGS:
                 reward += 0.25
-                reward += 0.30
+                # Shaped completion: residual bonus (most already distributed via progress)
+                already_shaped = 0.30 * (prev_fixed_count / self.TOTAL_BUGS)
+                reward += round(0.30 - already_shaped, 4)
                 done = True
             elif not fixed_this_step:
                 reward -= 0.05
@@ -221,6 +220,14 @@ class Task1AuditEnv:
             reward -= 0.10
 
         reward = max(-0.5, min(1.0, reward))
+
+        # Shaped completion bonus: per-step progress signal when bugs_fixed increases
+        new_fixed_count = len(self.fixed_bug_ids)
+        if new_fixed_count > prev_fixed_count and new_fixed_count < self.TOTAL_BUGS:
+            progress_reward = 0.30 * ((new_fixed_count - prev_fixed_count) / self.TOTAL_BUGS)
+            reward += round(progress_reward, 4)
+            reward = max(-0.5, min(1.0, reward))
+
         self.step_count += 1
         self.downstream_health = len(self.fixed_bug_ids) / self.TOTAL_BUGS
         done = done or (self.step_count >= self.MAX_STEPS)
@@ -247,6 +254,10 @@ class Task1AuditEnv:
                 "visible_signals": self.visible_signals.model_dump() if self.visible_signals else {},
                 "aer_last": aer.model_dump(),
                 "step": self.step_count,
+                "action_space_hints": {
+                    "accepted_casts": ["cast_to_int", "cast_to_float"],
+                    "accepted_fills": ["fill_median", "fill_zero"],
+                },
             },
         )
 

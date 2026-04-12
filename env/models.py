@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import List, Literal, Optional
-
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -15,6 +14,30 @@ class ActionType(str, Enum):
     VALIDATE = "VALIDATE"
     MASK_PII = "MASK_PII"
     NOOP = "NOOP"
+
+
+class ScenarioBug(BaseModel):
+    """A single bug specification for procedural generation."""
+    bug_id: str
+    type: str
+    column: Optional[str] = None
+    old_col: Optional[str] = None
+    new_col: Optional[str] = None
+    row: Optional[int] = None
+    rows: Optional[list[int] | str] = None  # list of ints or "ALL"
+    value: Optional[str | int | float] = None
+    indices: Optional[list[int]] = None
+    severity: str = "medium"
+    description: str = ""
+    stage: Optional[str] = None
+
+
+class Scenario(BaseModel):
+    """A complete scenario specification for a task."""
+    bugs: list[ScenarioBug]
+    task_id: str = "task1"
+    seed: int = 42
+    difficulty: str = "easy"
 
 
 class DetectedIssue(BaseModel):
@@ -45,7 +68,7 @@ class DataObservation(BaseModel):
     downstream_health: float
     step_count: int
     task_id: int
-    max_steps: int = 8  # Per-task step budget exposed to agents via /reset
+    max_steps: int = 20  # Default to largest task budget
     pipeline_stage_health: Optional[dict[str, float]] = None
     agent_context: Optional[dict] = None
 

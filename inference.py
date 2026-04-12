@@ -15,6 +15,7 @@ Features:
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -61,13 +62,12 @@ def get_runtime_config() -> dict[str, str]:
     }
 
 
-# -- Constants (defaults; per-task values read from /reset response) -------
-# MAX_STEPS is NOT hardcoded here — each task exposes its own max_steps.
-# This value is used only as a fallback when /reset doesn't include it.
-_DEFAULT_MAX_STEPS = 20
+# -- Constants -------------------------------------------------------------
+# MAX_STEPS is read dynamically from /reset response (see run_episode).
+# These are defaults used only if the server does not provide max_steps.
+DEFAULT_MAX_STEPS = 20
 MAX_PARSE_RETRIES = 2
 ROLLING_WINDOW = 6
-# COMPACTION_STEP is derived dynamically: max(5, max_steps // 3)
 MAX_RUNTIME_SECS = 19 * 60
 HTTP_TIMEOUT = 30
 
@@ -94,6 +94,19 @@ _EPISODE_START: float = 0.0
 
 _SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}")
+
+
+# -- Structured output for validator --------------------------------------
+def print_start(task_name: str):
+    print(f"[START] task={task_name}", flush=True)
+
+
+def print_step(step_num: int, reward: float, action_type: str):
+    print(f"[STEP] step={step_num} reward={round(reward, 4)} action={action_type}", flush=True)
+
+
+def print_end(task_name: str, score: float, steps: int):
+    print(f"[END] task={task_name} score={round(score, 4)} steps={steps}", flush=True)
 
 
 # -- Belief state ----------------------------------------------------------
@@ -190,7 +203,7 @@ OUTPUT: Reply ONLY with valid JSON, zero markdown, zero explanation:
 # -- Utility functions -----------------------------------------------------
 def _check_runtime():
     if time.time() - _EPISODE_START > MAX_RUNTIME_SECS:
-        print(f"\n[TIMEOUT] Exceeded {MAX_RUNTIME_SECS // 60}min. Stopping.")
+        print(f"\n[TIMEOUT] Exceeded {MAX_RUNTIME_SECS // 60}min. Stopping.", flush=True)
         sys.exit(1)
 
 
@@ -241,9 +254,9 @@ def _truncate_messages(messages: list[dict], system_msg: dict) -> list[dict]:
     return [system_msg] + non_sys
 
 
-def _build_escalation_summary(belief: BeliefState, step_num: int) -> str:
+def _build_escalation_summary(belief: BeliefState, step_num: int, max_steps: int = 20) -> str:
     """
-    At step 6, inject compressed incident summary.
+    Inject compressed incident summary at compaction step.
     Replaces verbose history. Focuses agent on resolution.
     Saves token cost for remaining steps.
     """
@@ -255,15 +268,15 @@ def _build_escalation_summary(belief: BeliefState, step_num: int) -> str:
         f"Confidence: {belief.confidence:.2f}\n"
         f"Signals unlocked: {belief.signals_unlocked or ['none']}\n"
         f"Recent errors: {belief.step_errors[-3:] or ['none']}\n"
-        f"--- You have {MAX_STEPS - step_num - 1} steps left. "
+        f"--- You have {max_steps - step_num - 1} steps left. "
         f"If all fixes applied, use VALIDATE. "
         f"If PII exposed, use MASK_PII on 'ssn' immediately. ---"
     )
 
 
-def _observation_to_prompt(obs: dict, belief: BeliefState, step_num: int) -> str:
+def _observation_to_prompt(obs: dict, belief: BeliefState, step_num: int, max_steps: int = 20) -> str:
     lines = [
-        f"=== STEP {step_num + 1}/{MAX_STEPS} ===",
+        f"=== STEP {step_num + 1}/{max_steps} ===",
         f"Stage: {obs.get('pipeline_stage', '?')} | "
         f"Remaining: {obs.get('time_remaining', 0)} | "
         f"Health: {obs.get('downstream_health', 0):.2f}",
@@ -401,7 +414,8 @@ def _update_belief_state(belief: dict, action: dict, result: dict) -> dict:
     return belief
 
 
-def _compaction_summary(belief_state: dict, step_errors: list[str]) -> str:
+def _compaction_summary(belief_state: dict, step_errors: list[str], max_steps: int = 20) -> str:
+    compaction_step = max(5, max_steps // 3)
     state = BeliefState(
         candidate_causes=list(belief_state.get("candidates", [])),
         eliminated_causes=list(belief_state.get("eliminated", [])),
@@ -411,198 +425,257 @@ def _compaction_summary(belief_state: dict, step_errors: list[str]) -> str:
         signals_unlocked=list(belief_state.get("signals_unlocked", [])),
         step_errors=list(step_errors),
     )
-    return _build_escalation_summary(state, 5)
+    return _build_escalation_summary(state, compaction_step, max_steps=max_steps)
 
 
 # -- Episode loop ----------------------------------------------------------
-def run_episode(task_id: int, config: dict[str, str], client: OpenAI) -> float:
-    _check_runtime()
+TASK_NAMES = {
+    1: "DataQualityAudit",
+    2: "SchemaDriftRemediation",
+    3: "FullIncidentResponse",
+}
 
-    resp = http.post(
-        f"{config['api_base_url']}/reset",
-        params={"task_id": task_id},
-        timeout=HTTP_TIMEOUT,
-    )
-    resp.raise_for_status()
-    obs = resp.json()
-    # Fix 2.3: visible_signals always empty at reset (no step has occurred).
-    # Only populate from StepResult.info starting at step 1.
-    obs["visible_signals"] = {}
 
-    # Fix 1.2: read per-task max_steps from /reset response; fall back to 20
-    max_steps = int(obs.get("time_remaining", _DEFAULT_MAX_STEPS) or _DEFAULT_MAX_STEPS)
-    if max_steps <= 0:
-        max_steps = _DEFAULT_MAX_STEPS
-    compaction_step = max(5, max_steps // 3)
-    print(f"  [INFO] Task {task_id}: max_steps={max_steps}, compaction_step={compaction_step}, initial_signals=[]")
+def run_episode(task_id: int, config: dict[str, str], client: OpenAI, seed: int | None = None) -> float:
+    task_name = TASK_NAMES.get(task_id, f"Task{task_id}")
 
-    system_msg = {"role": "system", "content": SYSTEM_PROMPT}
-    messages = [system_msg]
-    belief = BeliefState()
+    # FIX A: Print [START] BEFORE any HTTP or config calls.
+    # The validator is fail-fast: if [START] is missing the pipeline stops.
+    print_start(task_name)
 
-    for step_num in range(max_steps):
+    # FIX B: try/except guarantees [END] is always printed, even on crash.
+    steps_taken = 0
+    try:
         _check_runtime()
 
-        if step_num == compaction_step:
-            summary = _build_escalation_summary(belief, step_num)
-            non_sys = [m for m in messages if m["role"] != "system"]
-            last_two = non_sys[-2:] if len(non_sys) >= 2 else non_sys
-            messages = [system_msg, {"role": "user", "content": summary}] + last_two
-            print(
-                f"  [ESCALATION] Injected summary - "
-                f"confidence={belief.confidence:.2f} "
-                f"candidates={belief.candidate_causes}"
-            )
+        params = {"task_id": task_id}
+        if seed is not None:
+            params["seed"] = seed
 
-        user_msg = _observation_to_prompt(obs, belief, step_num)
-        messages.append({"role": "user", "content": user_msg})
-        messages = _truncate_messages(messages, system_msg)
+        resp = http.post(
+            f"{config['api_base_url']}/reset",
+            params=params,
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        obs = resp.json()
 
-        action = None
-        last_error = ""
+        # Read max_steps from reset response (Fix 1.2 / 6.1)
+        max_steps = int(obs.get("max_steps", DEFAULT_MAX_STEPS))
+        compaction_step = max(5, max_steps // 3)
 
-        for attempt in range(MAX_PARSE_RETRIES + 1):
-            if attempt > 0:
-                correction = (
-                    f"Your previous output was invalid: {last_error}. "
-                    f"Reply ONLY with valid JSON. No markdown. No text."
+        # Fix 2.3: visible_signals is empty after reset (no step has occurred)
+        # Only populate from StepResult.info starting at step 1
+        obs["visible_signals"] = {}
+
+        import logging
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+        logger.info(f"Task {task_id}: max_steps={max_steps}, initial_signals=[]")
+
+        system_msg = {"role": "system", "content": SYSTEM_PROMPT}
+        messages = [system_msg]
+        belief = BeliefState()
+
+        # FIX D: Initialize step_num before loop to avoid undefined variable
+        step_num = 0
+        for step_num in range(max_steps):
+            _check_runtime()
+
+            if step_num == compaction_step:
+                summary = _build_escalation_summary(belief, step_num, max_steps=max_steps)
+                non_sys = [m for m in messages if m["role"] != "system"]
+                last_two = non_sys[-2:] if len(non_sys) >= 2 else non_sys
+                messages = [system_msg, {"role": "user", "content": summary}] + last_two
+                print(
+                    f"  [ESCALATION] Injected summary - "
+                    f"confidence={belief.confidence:.2f} "
+                    f"candidates={belief.candidate_causes}",
+                    flush=True,
                 )
-                messages.append({"role": "user", "content": correction})
+
+            user_msg = _observation_to_prompt(obs, belief, step_num, max_steps=max_steps)
+            messages.append({"role": "user", "content": user_msg})
+            messages = _truncate_messages(messages, system_msg)
+
+            action = None
+            last_error = ""
+
+            for attempt in range(MAX_PARSE_RETRIES + 1):
+                if attempt > 0:
+                    correction = (
+                        f"Your previous output was invalid: {last_error}. "
+                        f"Reply ONLY with valid JSON. No markdown. No text."
+                    )
+                    messages.append({"role": "user", "content": correction})
+
+                try:
+                    response = client.chat.completions.create(
+                        model=config["model_name"],
+                        messages=messages,
+                        temperature=0.2,
+                        max_tokens=512,
+                    )
+                    raw = response.choices[0].message.content or ""
+                except Exception as exc:
+                    last_error = str(exc)
+                    belief.step_errors.append(f"LLM error: {exc}")
+                    print(f"  [LLM ERROR] {exc}", flush=True)
+                    raw = ""
+
+                parsed = _parse_json_from_text(raw) if raw else None
+                if parsed and _validate_action(parsed):
+                    action = parsed
+                    messages.append({"role": "assistant", "content": raw})
+                    break
+
+                last_error = (
+                    f"Invalid action_type "
+                    f"'{parsed.get('action_type') if parsed else 'none'}' "
+                    f"or missing justification"
+                )
+
+            if action is None:
+                action = FALLBACK_ACTION
+                messages.append({"role": "assistant", "content": json.dumps(FALLBACK_ACTION)})
+                print(f"  [FALLBACK] NOOP after {MAX_PARSE_RETRIES} retries", flush=True)
 
             try:
-                response = client.chat.completions.create(
-                    model=config["model_name"],
-                    messages=messages,
-                    temperature=0.2,
-                    max_tokens=512,
+                step_resp = http.post(
+                    f"{config['api_base_url']}/step",
+                    json=action,
+                    params={"task_id": task_id},
+                    timeout=HTTP_TIMEOUT,
                 )
-                raw = response.choices[0].message.content or ""
+                step_resp.raise_for_status()
+                result = step_resp.json()
             except Exception as exc:
-                last_error = str(exc)
-                belief.step_errors.append(f"LLM error: {exc}")
-                print(f"  [LLM ERROR] {exc}")
-                raw = ""
-
-            parsed = _parse_json_from_text(raw) if raw else None
-            if parsed and _validate_action(parsed):
-                action = parsed
-                messages.append({"role": "assistant", "content": raw})
+                print(f"  [STEP ERROR] {exc}", flush=True)
+                belief.step_errors.append(str(exc))
+                steps_taken = step_num + 1
                 break
 
-            last_error = (
-                f"Invalid action_type "
-                f"'{parsed.get('action_type') if parsed else 'none'}' "
-                f"or missing justification"
-            )
+            obs = result.get("observation", obs)
+            done = result.get("done", False)
+            reward = float(result.get("reward", 0.0))
+            print_step(step_num + 1, reward, action.get("action_type", "NOOP"))
+            info = result.get("info", {})
+            obs["visible_signals"] = info.get("visible_signals", {})
 
-        if action is None:
-            action = FALLBACK_ACTION
-            messages.append({"role": "assistant", "content": json.dumps(FALLBACK_ACTION)})
-            print(f"  [FALLBACK] NOOP after {MAX_PARSE_RETRIES} retries")
+            belief = _update_belief(belief, action, result)
+
+            justif_short = _sanitize_pii(action.get("justification", ""))[:55]
+            print(
+                f"  Step {step_num + 1:02d} | "
+                f"{action['action_type']:15s} | "
+                f"target={str(action.get('target_column', ''))[:10]:10s} | "
+                f"reward={reward:+.3f} | "
+                f"health={obs.get('downstream_health', 0):.2f} | "
+                f"conf={belief.confidence:.2f} | "
+                f"done={done}",
+                flush=True,
+            )
+            print(f"          '{justif_short}...'", flush=True)
+
+            steps_taken = step_num + 1
+
+            if done:
+                print(f"  [DONE] Completed at step {step_num + 1}", flush=True)
+                break
 
         try:
-            step_resp = http.post(
-                f"{config['api_base_url']}/step",
-                json=action,
+            grade_resp = http.get(
+                f"{config['api_base_url']}/grader",
                 params={"task_id": task_id},
                 timeout=HTTP_TIMEOUT,
             )
-            step_resp.raise_for_status()
-            result = step_resp.json()
+            grade_resp.raise_for_status()
+            grade = grade_resp.json()
         except Exception as exc:
-            print(f"  [STEP ERROR] {exc}")
-            belief.step_errors.append(str(exc))
-            break
+            print(f"  [GRADER ERROR] {exc}", flush=True)
+            print_end(task_name, 0.0, steps_taken)
+            return 0.0
 
-        obs = result.get("observation", obs)
-        done = result.get("done", False)
-        reward = float(result.get("reward", 0.0))
-        info = result.get("info", {})
-        obs["visible_signals"] = info.get("visible_signals", {})
+        score = float(grade.get("score", 0.0))
+        breakdown = grade.get("breakdown", {})
+        explanation = grade.get("explanation", "")
 
-        belief = _update_belief(belief, action, result)
+        print("\n  GRADER:", flush=True)
+        for key, value in breakdown.items():
+            print(f"    {key:30s} = {value}", flush=True)
+        print(f"  {explanation}", flush=True)
+        print("\n  BeliefState final:", flush=True)
+        print(f"    candidates  = {belief.candidate_causes}", flush=True)
+        print(f"    confirmed   = {belief.confirmed_fixes}", flush=True)
+        print(f"    confidence  = {belief.confidence:.2f}", flush=True)
+        print(f"    signals     = {belief.signals_unlocked}", flush=True)
 
-        justif_short = _sanitize_pii(action.get("justification", ""))[:55]
-        print(
-            f"  Step {step_num + 1:02d} | "
-            f"{action['action_type']:15s} | "
-            f"target={str(action.get('target_column', ''))[:10]:10s} | "
-            f"reward={reward:+.3f} | "
-            f"health={obs.get('downstream_health', 0):.2f} | "
-            f"conf={belief.confidence:.2f} | "
-            f"done={done}"
-        )
-        print(f"          '{justif_short}...'")
+        print_end(task_name, score, steps_taken)
+        return score
 
-        if done:
-            print(f"  [DONE] Completed at step {step_num + 1}")
-            break
-
-    try:
-        grade_resp = http.get(
-            f"{config['api_base_url']}/grader",
-            params={"task_id": task_id},
-            timeout=HTTP_TIMEOUT,
-        )
-        grade_resp.raise_for_status()
-        grade = grade_resp.json()
     except Exception as exc:
-        print(f"  [GRADER ERROR] {exc}")
+        # FIX B: Guarantee [END] appears even on total failure
+        print(f"  [EPISODE ERROR] {exc}", flush=True)
+        print_end(task_name, 0.0, steps_taken)
         return 0.0
-
-    score = float(grade.get("score", 0.0))
-    breakdown = grade.get("breakdown", {})
-    explanation = grade.get("explanation", "")
-
-    print("\n  GRADER:")
-    for key, value in breakdown.items():
-        print(f"    {key:30s} = {value}")
-    print(f"  {explanation}")
-    print("\n  BeliefState final:")
-    print(f"    candidates  = {belief.candidate_causes}")
-    print(f"    confirmed   = {belief.confirmed_fixes}")
-    print(f"    confidence  = {belief.confidence:.2f}")
-    print(f"    signals     = {belief.signals_unlocked}")
-
-    return score
 
 
 # -- Entry point -----------------------------------------------------------
 def main() -> None:
+    parser = argparse.ArgumentParser(description="DataPipelineEnv Inference Loop")
+    parser.add_argument("--task", type=int, choices=[1, 2, 3], help="Specific task ID to run (1, 2, or 3)")
+    parser.add_argument("--seed", type=int, help="Seed for procedural generation")
+    args = parser.parse_args()
+
     global _EPISODE_START
-    config = get_runtime_config()
+    _EPISODE_START = time.time()
+
+    tasks_to_run = [args.task] if args.task else [1, 2, 3]
+
+    # FIX C: Guard get_runtime_config() so a missing env var never
+    # prevents [START]/[END] from appearing in stdout.
+    try:
+        config = get_runtime_config()
+    except EnvironmentError as e:
+        print(f"[CONFIG ERROR] {e}", flush=True)
+        for task_id in tasks_to_run:
+            name = TASK_NAMES.get(task_id, f"Task{task_id}")
+            print_start(name)
+            print_end(name, 0.0, 0)
+        sys.exit(1)
+
     client = OpenAI(
         api_key=config["token"],
         base_url=config["llm_base_url"],
     )
 
-    _EPISODE_START = time.time()
     scores: dict[int, float] = {}
 
-    for task_id in [1, 2, 3]:
-        print(f"\n{'=' * 65}")
-        print(f"  TASK {task_id}")
-        print(f"{'=' * 65}")
+    for task_id in tasks_to_run:
+        print(f"\n{'=' * 65}", flush=True)
+        print(f"  TASK {task_id}", flush=True)
+        print(f"{'=' * 65}", flush=True)
         try:
-            scores[task_id] = run_episode(task_id, config, client)
+            scores[task_id] = run_episode(task_id, config, client, seed=args.seed)
         except Exception as exc:
-            print(f"  [TASK {task_id} FAILED] {exc}")
+            print(f"  [TASK {task_id} FAILED] {exc}", flush=True)
             scores[task_id] = 0.0
 
         elapsed = time.time() - _EPISODE_START
         print(
             f"\n  -> Task {task_id} Score: {scores[task_id]:.4f} "
-            f"(elapsed: {elapsed:.0f}s/{MAX_RUNTIME_SECS}s)"
+            f"(elapsed: {elapsed:.0f}s/{MAX_RUNTIME_SECS}s)",
+            flush=True,
         )
 
-    avg = sum(scores.values()) / 3
-    print(f"\n{'=' * 65}")
-    print("  FINAL RESULTS")
-    print(f"  Task 1: {scores.get(1, 0):.4f}")
-    print(f"  Task 2: {scores.get(2, 0):.4f}")
-    print(f"  Task 3: {scores.get(3, 0):.4f}")
-    print(f"  Average: {avg:.4f}")
-    print(f"{'=' * 65}")
+    avg = sum(scores.values()) / len(scores) if scores else 0.0
+    print(f"\n{'=' * 65}", flush=True)
+    print("  FINAL RESULTS", flush=True)
+    print(f"  Task 1: {scores.get(1, 0):.4f}", flush=True)
+    print(f"  Task 2: {scores.get(2, 0):.4f}", flush=True)
+    print(f"  Task 3: {scores.get(3, 0):.4f}", flush=True)
+    print(f"  Average: {avg:.4f}", flush=True)
+    print(f"{'=' * 65}", flush=True)
 
     try:
         http.post(

@@ -9,12 +9,12 @@ import pandas as pd
 from env.data.bug_injector import (
     build_logs_facet,
     build_metrics_facet,
+    generate_scenario,
     get_failure_signature,
     inject_bugs,
     load_scenario,
 )
 from env.data.generator import generate_employee_dataset
-from env.data.scenario_generator import generate_scenario
 from env.models import (
     AERRecord,
     ActionType,
@@ -32,7 +32,7 @@ from env.models import (
 class Task2SchemaEnv:
     """Task 2 environment for schema drift diagnosis and remediation."""
 
-    MAX_STEPS = 8
+    MAX_STEPS = 15
     TOTAL_BUGS = 3
     SCENARIO_DIR = Path(__file__).parent.parent / "data" / "scenarios"
 
@@ -58,24 +58,24 @@ class Task2SchemaEnv:
         self.current_scenario_path: Path | None = None
         self.inspected_targets: set[str] = set()
 
-    def reset(self, scenario_override: str | None = None) -> DataObservation:
-        """Reset state with a fresh procedurally generated scenario.
-        
-        Args:
-            scenario_override: Path to a specific scenario JSON. Used by /demo only.
-        """
+    def reset(self, seed: int = 42, scenario_override: str | None = None) -> DataObservation:
+        """Reset state and initialize a fresh corrupted Task2 dataframe."""
         if scenario_override:
-            self.current_scenario_path = Path(scenario_override)
-            with self.current_scenario_path.open("r", encoding="utf-8") as handle:
+            chosen = self.SCENARIO_DIR / scenario_override
+            self.current_scenario_path = chosen
+            # Reload dependencies from chosen scenario
+            with chosen.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             self.COLUMN_DEPENDENCIES = payload.get("column_dependencies", self.COLUMN_DEPENDENCIES)
-            scenario_bugs = load_scenario(scenario_override)
+            scenario_bugs = load_scenario(str(chosen))
         else:
-            import random as _random
-            ep_seed = _random.randint(0, 9999)
-            scenario_bugs = generate_scenario(ep_seed, task_id=2, difficulty="medium")
+            # Procedural generation for live episodes
+            scenario_bugs = generate_scenario(seed=seed, task_id="task2", difficulty="medium")
             self.current_scenario_path = None
-        clean_df = generate_employee_dataset(seed=42)
+        # Cache scenario data for step() — NO file I/O in step path
+        self._scenario_bugs = scenario_bugs
+        self._expected_renames = {b["new_col"]: b["old_col"] for b in scenario_bugs if b.get("type") == "schema_drift"}
+        clean_df = generate_employee_dataset(seed=seed)
         self.df, self.ground_truth = inject_bugs(clean_df, scenario_bugs)
         self.step_count = 0
         self.identified_bug_ids = set()
@@ -133,8 +133,10 @@ class Task2SchemaEnv:
         """Apply one schema remediation step and return transition output."""
         reward = 0.0
         done = False
+        prev_fixed_count = len(self.fixed_bug_ids)
 
-        expected_renames = {b["new_col"]: b["old_col"] for b in self.ground_truth if b.get("type") == "schema_drift"}
+        # Read from cached scenario data (no file I/O in step path)
+        expected_renames = self._expected_renames
 
         if action.action_type == ActionType.INSPECT:
             target = (action.target_column or "").lower()
@@ -146,7 +148,7 @@ class Task2SchemaEnv:
             target = _TOOL_ALIASES.get(target, target)
 
             reinspecting = target in self.inspected_targets
-            if reinspecting: reward -= 0.05
+            if reinspecting: reward -= 0.10  # Raised re-inspect penalty
             else: self.inspected_targets.add(target)
 
             if target == "metrics" and "metrics" not in self.signals_unlocked:
@@ -247,7 +249,9 @@ class Task2SchemaEnv:
             rows_passing = self._rows_passing()
             if len(self.fixed_bug_ids) == self.TOTAL_BUGS:
                 reward += 0.25
-                reward += 0.30
+                # Shaped completion: residual bonus
+                already_shaped = 0.30 * (prev_fixed_count / self.TOTAL_BUGS)
+                reward += round(0.30 - already_shaped, 4)
                 done = True
             else:
                 reward -= 0.05
@@ -258,6 +262,14 @@ class Task2SchemaEnv:
             reward -= 0.10
 
         reward = max(-0.5, min(1.0, reward))
+
+        # Shaped completion bonus: per-step progress signal
+        new_fixed_count = len(self.fixed_bug_ids)
+        if new_fixed_count > prev_fixed_count and new_fixed_count < self.TOTAL_BUGS:
+            progress_reward = 0.30 * ((new_fixed_count - prev_fixed_count) / self.TOTAL_BUGS)
+            reward += round(progress_reward, 4)
+            reward = max(-0.5, min(1.0, reward))
+
         self.step_count += 1
         self.downstream_health = len(self.fixed_bug_ids) / self.TOTAL_BUGS
         done = done or (self.step_count >= self.MAX_STEPS)
@@ -276,6 +288,16 @@ class Task2SchemaEnv:
                 "identified": list(self.identified_bug_ids), "signals_unlocked": list(self.signals_unlocked),
                 "visible_signals": self.visible_signals.model_dump() if self.visible_signals else {},
                 "aer_last": aer.model_dump(),
+                "action_space_hints": {
+                    "accepted_casts": ["cast_to_date", "cast_to_int", "cast_to_float"],
+                    "accepted_fills": ["fill_median", "fill_zero"],
+                    "cast_target_columns": {
+                        "hire_date": "cast_to_date",
+                        "dob_date": "cast_to_date",
+                        "salary": "cast_to_int",
+                        "age": "cast_to_int",
+                    },
+                },
             },
         )
 

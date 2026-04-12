@@ -62,43 +62,33 @@ def grade_task2(env: Task2SchemaEnv) -> GraderResult:
     """
     Task 2: Schema Drift Remediation scorer.
     Formula:
-      base          = rows_passing / total_rows
-      col_recovery  = present_expected_cols / total_expected_cols
-      type_correct  = correct_dtype_cols / checked_cols
-      composite     = base*0.60 + col_recovery*0.25 + type_correct*0.15
+      fix_score     = len(fixed_bug_ids) / TOTAL_BUGS
       blast_penalty = -0.10 * blast_events
-      score         = clamp(composite + blast_penalty, 0.0, 1.0)
+      score         = clamp(fix_score + blast_penalty, 0.0001, 0.9999)
     """
     total = len(env.df) if env.df is not None else 0
     if total == 0:
-        return GraderResult(score=0.0, breakdown={}, explanation="Empty DataFrame.")
+        return GraderResult(score=0.0001, breakdown={}, explanation="Empty DataFrame.")
 
-    passing = _rows_passing(env)
-    base = round(passing / total, 4)
-    col_recovery = _column_recovery(env)
-    type_correct = _type_correctness(env)
-    composite = base * 0.60 + col_recovery * 0.25 + type_correct * 0.15
+    total_bugs = getattr(env, "TOTAL_BUGS", 5)
+    
+    fix_score = len(env.fixed_bug_ids) / total_bugs
     blast_penalty = round(-0.10 * env.blast_events, 4)
-    score = round(max(0.0, min(1.0, composite + blast_penalty)), 4)
+    score = round(max(0.0001, min(0.9999, fix_score + blast_penalty)), 4)
 
     return GraderResult(
         score=score,
         breakdown={
-            "rows_validation": base,
-            "schema_compliance": base,
-            "column_recovery": col_recovery,
-            "column_coverage": col_recovery,
-            "type_correctness": type_correct,
+            "bugs_fixed": round(len(env.fixed_bug_ids) / total_bugs, 4),
+            "fix_score": fix_score,
             "blast_radius_penalty": blast_penalty,
-            "bugs_fixed": round(len(env.fixed_bug_ids) / env.TOTAL_BUGS, 4),
-            "rows_passing": float(passing),
-            "total_rows": float(total),
             "blast_events": float(env.blast_events),
+            "rows_passing": float(_rows_passing(env)),
+            "column_recovery": _column_recovery(env),
+            "type_correctness": _type_correctness(env),
         },
         explanation=(
-            f"rows_ok={passing}/{total}(x0.60), "
-            f"col_recovery={col_recovery}(x0.25), "
-            f"type_ok={type_correct}(x0.15), "
+            f"fix_score={fix_score}, "
             f"blast_penalty={blast_penalty} -> {score}"
         ),
     )

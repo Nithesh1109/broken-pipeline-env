@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from env.models import DetectedIssue
+from env.models import DetectedIssue, LogsFacet, MetricsFacet
 
 
 # Canonical matching function — used by ALL graders
@@ -108,7 +108,17 @@ def inject_bugs(df: pd.DataFrame, bug_spec: list[dict]) -> tuple[pd.DataFrame, l
                 affected_rows = []
 
             elif bug_type == "pii_leak":
-                # SSN already present — flag in ground truth only
+                # Dynamically inject an employee_ssn column with plausible fake values
+                # This makes PII detection a real discovery task, not just a column lookup
+                import numpy as np
+                _pii_rng = np.random.default_rng(hash(bug.get("bug_id", "B003")) % (2**31))
+                ssn_values = [
+                    f"{_pii_rng.integers(100,999)}-{_pii_rng.integers(10,99)}-{_pii_rng.integers(1000,9999)}"
+                    for _ in range(len(corrupted))
+                ]
+                pii_col = bug.get("column", "employee_ssn")
+                if pii_col not in corrupted.columns:
+                    corrupted[pii_col] = ssn_values
                 affected_rows = list(range(len(corrupted)))
 
             elif bug_type == "duplicate_rows":
@@ -127,12 +137,172 @@ def inject_bugs(df: pd.DataFrame, bug_spec: list[dict]) -> tuple[pd.DataFrame, l
                     "description": bug.get("description", ""),
                     "severity": bug.get("severity", "medium"),
                     "affected_rows": affected_rows,
-                    "old_col": bug.get("old_col"),
-                    "new_col": bug.get("new_col"),
                 }
             )
 
     return corrupted, ground_truth
+
+
+def generate_scenario(seed: int, task_id: str, difficulty: str = "easy") -> list[dict]:
+    """
+    Procedurally generate a bug scenario based on seed, task_id, and difficulty.
+    
+    Uses the seed to select bug types from weighted distribution, randomly
+    selects target columns and row indices. Returns a list of bug dicts
+    compatible with inject_bugs().
+    
+    Static JSON scenarios are preserved as fallback for /demo only.
+    All live /reset calls should use this function.
+    """
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    
+    # Column pools per task
+    NUMERIC_COLS = ["salary", "age"]
+    STRING_COLS = ["phone", "name", "department"]
+    DATE_COLS = ["hire_date"]
+    ALL_COLS = NUMERIC_COLS + STRING_COLS + DATE_COLS
+    
+    # Bug type weights by difficulty
+    BUG_POOLS = {
+        "task1": {
+            "types": ["null_injection", "type_corruption", "out_of_range", "format_inconsistency", "duplicate_rows"],
+            "weights": [0.25, 0.25, 0.2, 0.15, 0.15],
+            "count": 5,
+        },
+        "task2": {
+            "types": ["schema_drift", "schema_drift", "type_corruption", "null_injection"],
+            "weights": [0.35, 0.25, 0.2, 0.2],
+            "count": 3,
+        },
+        "task3": {
+            "types": ["schema_drift", "type_corruption", "pii_leak", "duplicate_rows"],
+            "weights": [0.25, 0.30, 0.25, 0.20],
+            "count": 4,
+        },
+    }
+    
+    pool = BUG_POOLS.get(task_id, BUG_POOLS["task1"])
+    bug_count = pool["count"]
+    
+    # Select bug types ensuring diversity (at least 3 different types for task1)
+    selected_types: list[str] = []
+    available_types = list(set(pool["types"]))
+    
+    if task_id == "task1":
+        # Enforce at least 3 different types
+        min_diverse = min(3, len(available_types))
+        diverse_picks = rng.choice(available_types, size=min_diverse, replace=False).tolist()
+        selected_types.extend(diverse_picks)
+        remaining = bug_count - len(selected_types)
+        if remaining > 0:
+            extra = rng.choice(pool["types"], size=remaining, p=pool["weights"] if len(pool["weights"]) == len(pool["types"]) else None).tolist()
+            selected_types.extend(extra)
+    else:
+        # For task2/task3, use predefined structure
+        selected_types = pool["types"][:bug_count]
+    
+    # Severity mapping by difficulty
+    severity_pool = {
+        "easy": ["medium", "high"],
+        "medium": ["high", "critical"],
+        "hard": ["critical", "critical", "high"],
+    }
+    severities = severity_pool.get(difficulty, ["medium", "high"])
+    
+    # Rename column mappings for schema_drift
+    RENAME_MAPPINGS = [
+        ("employee_id", "customer_uuid"),
+        ("hire_date", "dob_date"),
+        ("salary", "rev_amt"),
+        ("department", "dept_code"),
+        ("name", "full_name"),
+    ]
+    
+    bugs: list[dict] = []
+    used_rename_indices: set[int] = set()
+    used_rows: set[int] = set()
+    
+    for i, bug_type in enumerate(selected_types[:bug_count]):
+        bug_id = f"B{i+1:03d}"
+        severity = severities[rng.integers(0, len(severities))]
+        
+        if bug_type == "null_injection":
+            col = rng.choice(NUMERIC_COLS)
+            rows = sorted(rng.choice(range(5, 195), size=rng.integers(2, 5), replace=False).tolist())
+            bugs.append({
+                "bug_id": bug_id, "type": "null_injection", "column": col,
+                "rows": rows, "severity": severity,
+                "description": f"NULL values injected in {col} column at rows {rows}",
+            })
+            
+        elif bug_type == "type_corruption":
+            col = rng.choice(NUMERIC_COLS)
+            row = int(rng.integers(1, 190))
+            while row in used_rows:
+                row = int(rng.integers(1, 190))
+            used_rows.add(row)
+            values = ["twenty-three", "N/A", "unknown", "1234.56"]
+            bugs.append({
+                "bug_id": bug_id, "type": "type_corruption", "column": col,
+                "row": row, "value": rng.choice(values),
+                "severity": severity,
+                "description": f"{col} stored as string at row {row}",
+            })
+            
+        elif bug_type == "out_of_range":
+            row = int(rng.integers(1, 190))
+            while row in used_rows:
+                row = int(rng.integers(1, 190))
+            used_rows.add(row)
+            bugs.append({
+                "bug_id": bug_id, "type": "out_of_range", "column": "age",
+                "row": row, "value": int(rng.choice([999, -1, 500, 255])),
+                "severity": severity,
+                "description": f"Age value out of valid range at row {row}",
+            })
+            
+        elif bug_type == "format_inconsistency":
+            row = int(rng.integers(1, 190))
+            while row in used_rows:
+                row = int(rng.integers(1, 190))
+            used_rows.add(row)
+            bugs.append({
+                "bug_id": bug_id, "type": "format_inconsistency", "column": "phone",
+                "row": row, "severity": "low",
+                "description": f"Phone reformatted at row {row}",
+            })
+            
+        elif bug_type == "schema_drift":
+            available = [j for j in range(len(RENAME_MAPPINGS)) if j not in used_rename_indices]
+            if not available:
+                available = list(range(len(RENAME_MAPPINGS)))
+            idx = rng.choice(available)
+            used_rename_indices.add(idx)
+            old_col, new_col = RENAME_MAPPINGS[idx]
+            bugs.append({
+                "bug_id": bug_id, "type": "schema_drift",
+                "old_col": old_col, "new_col": new_col,
+                "severity": severity,
+                "description": f"{old_col} renamed to {new_col} upstream",
+            })
+            
+        elif bug_type == "pii_leak":
+            bugs.append({
+                "bug_id": bug_id, "type": "pii_leak", "column": "ssn",
+                "severity": "critical",
+                "description": "SSN column propagated into analytics output",
+            })
+            
+        elif bug_type == "duplicate_rows":
+            indices = sorted(rng.choice(range(10, 190), size=rng.integers(2, 4), replace=False).tolist())
+            bugs.append({
+                "bug_id": bug_id, "type": "duplicate_rows", "column": None,
+                "indices": indices, "severity": severity,
+                "description": f"Rows {indices} duplicated",
+            })
+    
+    return bugs
 
 
 def get_failure_signature(bug_spec: list[dict]):
@@ -190,10 +360,8 @@ def get_failure_signature(bug_spec: list[dict]):
     )
 
 
-def build_metrics_facet(df, historical_avg: int = 200) -> "MetricsFacet":
+def build_metrics_facet(df, historical_avg: int = 200) -> MetricsFacet:
     """Build MetricsFacet from current DataFrame state."""
-    from env.models import MetricsFacet
-
     null_ratio = float(df.isnull().sum().sum() / max(df.size, 1))
     return MetricsFacet(
         row_count=len(df),
@@ -203,10 +371,8 @@ def build_metrics_facet(df, historical_avg: int = 200) -> "MetricsFacet":
     )
 
 
-def build_logs_facet(error_list: list[str], status: str = "failed") -> "LogsFacet":
+def build_logs_facet(error_list: list[str], status: str = "failed") -> LogsFacet:
     """Build LogsFacet from accumulated error messages."""
-    from env.models import LogsFacet
-
     return LogsFacet(
         recent_errors=error_list[-5:],
         last_run_status=status,

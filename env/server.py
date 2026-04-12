@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
-import threading
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -16,39 +13,45 @@ from env.tasks.task1_audit import Task1AuditEnv
 from env.tasks.task2_schema import Task2SchemaEnv
 from env.tasks.task3_incident import Task3IncidentEnv
 
-
 # STATE ISOLATION WARNING:
 # _envs is a module-level dict. This server must run with --workers 1.
 # Multi-worker deployment will cause cross-request state corruption.
 # For multi-worker support, replace _envs with Redis-backed session storage.
+import json as _json
+import threading
+
 _envs: dict[int, object] = {}
-
-# --- File-backed leaderboard ------------------------------------------------
-_LEADERBOARD_PATH = Path("leaderboard.json")
+_leaderboard: list[dict] = []
 _leaderboard_lock = threading.Lock()
+_LEADERBOARD_FILE = "leaderboard.json"
 
-def _load_leaderboard() -> list[dict]:
-    """Load leaderboard from disk, or start fresh."""
-    if _LEADERBOARD_PATH.exists():
-        try:
-            return json.loads(_LEADERBOARD_PATH.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, IOError):
-            return []
-    return []
 
-_leaderboard: list[dict] = _load_leaderboard()
+def _load_leaderboard() -> None:
+    """Load leaderboard from disk if it exists."""
+    global _leaderboard
+    try:
+        from pathlib import Path
+        p = Path(_LEADERBOARD_FILE)
+        if p.exists():
+            with p.open("r", encoding="utf-8") as f:
+                _leaderboard = _json.load(f)
+    except Exception:
+        _leaderboard = []
 
-def _persist_leaderboard() -> None:
-    """Write leaderboard to disk inside lock."""
-    with _leaderboard_lock:
-        _LEADERBOARD_PATH.write_text(
-            json.dumps(_leaderboard[-200:], indent=2), encoding="utf-8"
-        )
 
+def _save_leaderboard() -> None:
+    """Save leaderboard to disk (must hold _leaderboard_lock)."""
+    try:
+        from pathlib import Path
+        with Path(_LEADERBOARD_FILE).open("w", encoding="utf-8") as f:
+            _json.dump(_leaderboard, f, indent=2)
+    except Exception:
+        pass  # never crash on leaderboard I/O
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _load_leaderboard()
     _envs[1] = Task1AuditEnv()
     _envs[2] = Task2SchemaEnv()
     _envs[3] = Task3IncidentEnv()
@@ -92,7 +95,7 @@ def metadata() -> dict[str, Any]:
         "version": "1.0.0",
         "author": "Team BrokenPipeline",
         "tasks": 3,
-        "max_steps": 8,
+        "max_steps_per_task": {"task1": 10, "task2": 15, "task3": 20},
     }
 
 
@@ -159,7 +162,7 @@ def list_tasks() -> dict[str, Any]:
                 "id": 1,
                 "name": "Data Quality Audit",
                 "difficulty": "easy",
-                "max_steps": 8,
+                "max_steps": 10,
                 "curriculum_note": "Teaches: INSPECT → FIX pattern. Skills: null detection, type fixing, deduplication.",
                 "skills_taught": ["inspect_before_fix", "null_remediation", "type_casting", "deduplication"],
                 "expected_baseline_score": 0.0,
@@ -169,7 +172,7 @@ def list_tasks() -> dict[str, Any]:
                 "id": 2,
                 "name": "Schema Drift Remediation",
                 "difficulty": "medium",
-                "max_steps": 8,
+                "max_steps": 15,
                 "curriculum_note": "Builds on Task 1. Adds: schema understanding, column renaming, blast radius awareness.",
                 "skills_taught": ["schema_diff", "rename_column", "blast_radius_avoidance", "type_casting"],
                 "expected_baseline_score": 0.0,
@@ -196,14 +199,18 @@ def list_tasks() -> dict[str, Any]:
     }
 
 
+import random as _random
+
 @app.post("/reset", response_model=DataObservation)
-def reset(task_id: int = 1) -> DataObservation:
+def reset(task_id: int = 1, seed: int | None = None) -> DataObservation:
+    if seed is None:
+        seed = _random.randint(0, 9999)
     env = _get_env(task_id)
-    obs = env.reset()
+    obs = env.reset(seed=seed)
     return obs
 
 
-@app.get("/demo")
+@app.post("/demo")
 def demo() -> dict[str, Any]:
     """
     Run a deterministic smart agent on Task 1 base scenario.
@@ -212,15 +219,11 @@ def demo() -> dict[str, Any]:
     """
     # Create a fresh isolated env — never mutate shared _envs[1]
     from env.tasks.task1_audit import Task1AuditEnv
-    from pathlib import Path
     
     demo_env = Task1AuditEnv()
     
-    # Use scenario_override for clean, concurrent-safe base scenario (Fix 6.3)
-    base_scenario = str(
-        Path(__file__).parent / "data" / "scenarios" / "task1_scenario.json"
-    )
-    obs = demo_env.reset(scenario_override=base_scenario)
+    # Use scenario_override for deterministic base scenario selection
+    obs = demo_env.reset(scenario_override="task1_scenario.json")
     
     trace = []
     
@@ -310,7 +313,8 @@ def leaderboard() -> dict[str, Any]:
 
 @app.post("/record_score")
 def record_score(entry: dict) -> dict[str, Any]:
-    """Record a score from an agent run for leaderboard tracking."""
+    """Record a score from an agent run for leaderboard tracking.
+    Thread-safe and persisted to leaderboard.json."""
     import datetime
     with _leaderboard_lock:
         _leaderboard.append({
@@ -321,7 +325,7 @@ def record_score(entry: dict) -> dict[str, Any]:
             "average": entry.get("average", 0.0),
             "model": entry.get("model", "unknown"),
         })
-    _persist_leaderboard()
+        _save_leaderboard()
     return {"recorded": True, "total_entries": len(_leaderboard)}
 
 
@@ -331,7 +335,7 @@ def step(action: DataAction, task_id: int = 1) -> StepResult:
     return env.step(action)
 
 
-@app.get("/state")
+@app.post("/state")
 def state(task_id: int = 1) -> dict[str, Any]:
     env = _get_env(task_id)
     obs = env.state()
@@ -357,38 +361,12 @@ def state(task_id: int = 1) -> dict[str, Any]:
 @app.get("/grader", response_model=GraderResult)
 def grader(task_id: int = 1) -> GraderResult:
     if task_id == 1:
-        result = grade_task1(_envs[1])
-    elif task_id == 2:
-        result = grade_task2(_envs[2])
-    elif task_id == 3:
-        result = grade_task3(_envs[3])
-    else:
-        raise HTTPException(status_code=404, detail=f"task_id {task_id} not found")
-    # Persist score to leaderboard.json on every /grader call
-    import datetime
-    with _leaderboard_lock:
-        _leaderboard.append({
-            "timestamp": datetime.datetime.utcnow().isoformat(),
-            "task_id": task_id,
-            "score": result.score,
-            "breakdown": result.breakdown,
-            "source": "grader_endpoint",
-        })
-    _persist_leaderboard()
-    return result
-
-
-@app.get("/.well-known/env-info")
-def well_known_env_info() -> dict[str, Any]:
-    """Machine-readable deployment info for judges and validators."""
-    return {
-        "workers": 1,
-        "state_backend": "in-process",
-        "leaderboard_backend": "file",
-        "leaderboard_path": str(_LEADERBOARD_PATH),
-        "note": "Restart retains leaderboard (file-backed). State is per-worker in-memory; multi-worker deploy would require Redis.",
-    }
-
+        return grade_task1(_envs[1])
+    if task_id == 2:
+        return grade_task2(_envs[2])
+    if task_id == 3:
+        return grade_task3(_envs[3])
+    raise HTTPException(status_code=404, detail=f"task_id {task_id} not found")
 
 
 @app.get("/baseline")
@@ -399,7 +377,8 @@ def baseline() -> dict[str, Any]:
     for task_id in [1, 2, 3]:
         env = _get_env(task_id)
         env.reset()
-        for _ in range(8):
+        task_max = {1: 10, 2: 15, 3: 20}
+        for _ in range(task_max.get(task_id, 10)):
             env.step(DataAction(action_type=ActionType.NOOP, justification="baseline"))
         results[f"task_{task_id}"] = _graders[task_id](env).score
 
@@ -407,6 +386,7 @@ def baseline() -> dict[str, Any]:
         "agent": "noop_baseline",
         "description": "Deterministic NOOP agent — establishes lower bound score.",
         "scores": results,
+        "expected_baseline_score": 0.0,
     }
 
 
@@ -479,4 +459,14 @@ def replay(task_id: int = 1) -> dict[str, Any]:
         "total_steps": len(episode),
         "final_score": getattr(env, "downstream_health", 0.0),
         "episode": episode,
+    }
+
+
+@app.get("/.well-known/env-info")
+def env_info() -> dict[str, Any]:
+    """Deployment model metadata for judges."""
+    return {
+        "workers": 1,
+        "state_backend": "in-process",
+        "leaderboard_backend": "file",
     }

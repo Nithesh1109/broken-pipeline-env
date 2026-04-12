@@ -19,7 +19,7 @@ def grade_task1(env: Task1AuditEnv) -> GraderResult:
     total = env.TOTAL_BUGS
     if total == 0:
         return GraderResult(
-            score=0.0,
+            score=0.0001,
             breakdown={},
             explanation="No bugs defined in scenario.",
         )
@@ -39,7 +39,7 @@ def grade_task1(env: Task1AuditEnv) -> GraderResult:
     else:
         efficiency_bonus = 0.0
 
-    score = round(max(0.0, min(1.0, raw + efficiency_bonus)), 4)
+    score = round(max(0.0001, min(0.9999, raw + efficiency_bonus)), 4)
 
     return GraderResult(
         score=score,
