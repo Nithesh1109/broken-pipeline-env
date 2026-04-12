@@ -34,16 +34,14 @@ load_dotenv()
 
 
 def get_runtime_config() -> dict[str, str]:
-    api_base_url = os.getenv("API_BASE_URL", "http://localhost:7860")
-
-    # Judges inject API_KEY and API_BASE_URL — this is the primary path
+    # Judge injects both of these
     api_key = os.getenv("API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
     hf_token = os.getenv("HF_TOKEN")
 
     if api_key:
         token = api_key
-        llm_base_url = os.getenv("LLM_BASE_URL", api_base_url)
+        llm_base_url = os.environ["API_BASE_URL"]  # judge's proxy — hard require
         model_name = os.getenv("MODEL_NAME", "gpt-4o-mini")
     elif openai_key:
         token = openai_key
@@ -54,16 +52,15 @@ def get_runtime_config() -> dict[str, str]:
         llm_base_url = os.getenv("LLM_BASE_URL", "https://router.huggingface.co/v1")
         model_name = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
     else:
-        raise EnvironmentError(
-            "Set API_KEY, OPENAI_API_KEY, or HF_TOKEN."
-        )
+        raise EnvironmentError("Set API_KEY, OPENAI_API_KEY, or HF_TOKEN.")
 
     return {
-        "api_base_url": os.getenv("API_BASE_URL", "http://localhost:7860"),
+        "api_base_url": "http://localhost:7860",  # always your env server
         "model_name": model_name,
         "token": token,
-        "llm_base_url": llm_base_url,
+        "llm_base_url": llm_base_url,  # LLM proxy (judge's or yours)
     }
+
 
 
 # -- Constants -------------------------------------------------------------
